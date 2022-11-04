@@ -32,18 +32,23 @@
             python3 -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
             ```
 
-# Dataset Preparation
-- Download coco data
+# Validation Dataset Preparation
+- Download MSCOCO data https://cocodataset.org/#home
     ```
-    # From tf-models/research
-    mkdir mscoco
-    cd mscoco
-    wget http://images.cocodataset.org/zips/val2017.zip
-    wget http://images.cocodataset.org/annotations/annotations_trainval2017.zip
-    unzip val2017.zip
-    unzip annotations_trainval2017.zip
+    DOWNLOAD_DIR=dataset/mscoco
+    mkdir -p ${DOWNLOAD_DIR}
+
+    # Download mscoco data
+    wget http://images.cocodataset.org/zips/val2017.zip -O ${DOWNLOAD_DIR}/val2017.zip
+    wget http://images.cocodataset.org/annotations/annotations_trainval2017.zip -O ${DOWNLOAD_DIR}/annotations_trainval2017.zip
+    unzip ${DOWNLOAD_DIR}/val2017.zip -d ${DOWNLOAD_DIR}
+    unzip ${DOWNLOAD_DIR}/annotations_trainval2017.zip -d ${DOWNLOAD_DIR}
     ```
 - Create tfrecord files
     ```
-    python data_tools
+    python object_detection/dataset_tools/create_coco_val_tf_record.py \
+        --val_image_dir dataset/mscoco/val2017 \
+        --val_annotations_file dataset/mscoco/annotations/instances_val2017.json \
+        --output_dir dataset/mscoco/coco_val.record
     ```
+- source: https://github.com/google/automl/tree/master/efficientdet#7-eval-on-coco-2017-val-or-test-dev
