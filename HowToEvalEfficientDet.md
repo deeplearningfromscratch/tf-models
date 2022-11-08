@@ -52,3 +52,33 @@
         --output_dir dataset/mscoco/coco_val.record
     ```
 - source: https://github.com/google/automl/tree/master/efficientdet#7-eval-on-coco-2017-val-or-test-dev
+
+# ONNX Model Export
+- Download tensorflow pretrained EfficientNet-D0
+    ```
+    wget http://download.tensorflow.org/models/object_detection/tf2/20200711/efficientdet_d0_coco17_tpu-32.tar.gz
+    tar -xvf efficientdet_d0_coco17_tpu-32.tar.gz -C object_detection/
+    rm efficientdet_d0_coco17_tpu-32.tar.gz
+    ```
+- Export to convert traininig graph to inference graph(saved_model)
+    ```
+    python object_detection/exporter_main_v2.py \
+        --input_type image_tensor \
+        --pipeline_config_path object_detection/efficientdet_d0_coco17_tpu-32/pipeline.config \
+        --trained_checkpoint_dir object_detection/efficientdet_d0_coco17_tpu-32/checkpoint \
+        --output_directory object_detection/efficientdet_d0_coco17_tpu-32/eval
+    ```
+- Convert tensorflow saved model to ONNX
+    ```
+    pip install tf2onnx
+    python -m tf2onnx.convert --saved-model object_detection/efficientdet_d0_coco17_tpu-32/eval/saved_model/ --output object_detection/efficientdet_d0_coco17_tpu-32/eval/efficientdet_d0_orig.onnx --opset 13
+    ```
+- Remove pre/post-processing sub-graphs
+    ```
+    pip install furiosa-sdk
+    python object_detection/onnx_efficientdet_0_extracter.py
+    ```
+- source
+    - https://github.com/deeplearningfromscratch/tf-models/blob/master/research/object_detection/g3doc/tf2_detection_zoo.md
+    - https://github.com/onnx/tensorflow-onnx#getting-started
+    - https://github.com/onnx/onnx/blob/main/docs/PythonAPIOverview.md#extracting-sub-model-with-inputs-outputs-tensor-names
