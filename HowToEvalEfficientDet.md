@@ -92,3 +92,27 @@
     ```
 - source
     - https://furiosa-ai.github.io/docs/latest/en/software/cli.html?highlight=litmus#furiosa-litmus-checking-for-model-compatibility
+
+# Evaluate EfficientDet-D0(33.6 mAP(%))
+- original tensorflow model
+    ```
+    # (optional) to resolve https://stackoverflow.com/questions/55313610/importerror-libgl-so-1-cannot-open-shared-object-file-no-such-file-or-directo
+    apt-get update
+    apt-get install ffmpeg libsm6 libxext6
+    
+    # to resolve https://github.com/opencv/opencv-python/issues/591
+    pip install --upgrade opencv-python
+    pip install --upgrade opencv-contrib-python
+    pip install --upgrade opencv-python-headless
+    
+
+    # Evaluate tensorflow EfficientDet-D0
+    python object_detection/model_main_tf2.py \
+        --pipeline_config_path=object_detection/efficientdet_d0_coco17_tpu-32/config/pipeline.config \
+        --model_dir=object_detection/efficientdet_d0_coco17_tpu-32/eval/saved_model \
+        --checkpoint_dir=object_detection/efficientdet_d0_coco17_tpu-32/eval/checkpoint \
+        --alsologtostderr
+    ```
+    - source
+        - https://github.com/tensorflow/models/blob/master/research/object_detection/g3doc/tf2_detection_zoo.md
+        - https://github.com/tensorflow/models/blob/master/research/object_detection/g3doc/tf2_training_and_evaluation.md#evaluation
