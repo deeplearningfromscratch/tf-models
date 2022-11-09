@@ -82,3 +82,13 @@
     - https://github.com/deeplearningfromscratch/tf-models/blob/master/research/object_detection/g3doc/tf2_detection_zoo.md
     - https://github.com/onnx/tensorflow-onnx#getting-started
     - https://github.com/onnx/onnx/blob/main/docs/PythonAPIOverview.md#extracting-sub-model-with-inputs-outputs-tensor-names
+
+# Checking for model compatiblity
+- Check if model is compiled with Furiosa SDK
+    ```
+    pip install 'furiosa-sdk[litmus]'
+    # From Warboy pod
+    furiosa litmus object_detection/efficientdet_d0_coco17_tpu-32/eval/efficientdet_d0.onnx
+    ```
+- source
+    - https://furiosa-ai.github.io/docs/latest/en/software/cli.html?highlight=litmus#furiosa-litmus-checking-for-model-compatibility
