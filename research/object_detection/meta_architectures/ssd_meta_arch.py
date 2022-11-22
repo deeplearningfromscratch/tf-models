@@ -19,6 +19,7 @@ models.
 """
 import abc
 import tensorflow.compat.v1 as tf
+import numpy as np
 from tensorflow.python.util.deprecation import deprecated_args
 from object_detection.core import box_list
 from object_detection.core import box_list_ops
@@ -724,8 +725,20 @@ class SSDMetaArch(model.DetectionModel):
       detection_boxes = tf.identity(detection_boxes, 'raw_box_locations')
       detection_boxes = tf.expand_dims(detection_boxes, axis=2)
 
-      detection_scores_with_background = self._score_conversion_fn(
-          class_predictions_with_background)
+      # replaced with numpy sigmoid
+      # detection_scores_with_background = self._score_conversion_fn(
+      #     class_predictions_with_background)
+      #
+      # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L727-L728](https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L727-L728)
+      # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L135](https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L135)
+      # https://github.com/tensorflow/models/blob/238922e98dd0e8254b5c0921b241a1f5a151782f/research/object_detection/builders/post_processing_builder.py#L60-L62](https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/post_processing_builder.py#L60-L62)
+      # https://github.com/tensorflow/models/blob/238922e98dd0e8254b5c0921b241a1f5a151782f/research/object_detection/builders/post_processing_builder.py#L140-L141](https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/post_processing_builder.py#L140-L141)
+      # https://github.com/tensorflow/models/blob/238922e98dd0e8254b5c0921b241a1f5a151782f/research/object_detection/builders/post_processing_builder.py#L112-L119](https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/post_processing_builder.py#L112-L119)
+      def _sigmoid(x: np.ndarray) -> np.ndarray:
+        # pylint: disable=invalid-name
+        return 1 / (1 + np.exp(-x))
+      detection_scores_with_background = tf.convert_to_tensor(_sigmoid(class_predictions_with_background.numpy()))
+      
       detection_scores = tf.identity(detection_scores_with_background,
                                      'raw_box_scores')
       if self._add_background_class or self._explicit_background_class:
