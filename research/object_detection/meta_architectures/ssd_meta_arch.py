@@ -720,6 +720,8 @@ class SSDMetaArch(model.DetectionModel):
       box_encodings = tf.identity(box_encodings, 'raw_box_encodings')
       class_predictions_with_background = (
           prediction_dict['class_predictions_with_background'])
+      # print(f'{self._batch_decode}')
+      # self._batch_decode=<bound method SSDMetaArch._batch_decode of <object_detection.meta_architectures.ssd_meta_arch.SSDMetaArch object at 0x7fa8a82edfd0>>
       detection_boxes, detection_keypoints = self._batch_decode(
           box_encodings, prediction_dict['anchors'])
       detection_boxes = tf.identity(detection_boxes, 'raw_box_locations')
@@ -738,7 +740,7 @@ class SSDMetaArch(model.DetectionModel):
         # pylint: disable=invalid-name
         return 1 / (1 + np.exp(-x))
       detection_scores_with_background = tf.convert_to_tensor(_sigmoid(class_predictions_with_background.numpy()))
-      
+
       detection_scores = tf.identity(detection_scores_with_background,
                                      'raw_box_scores')
       if self._add_background_class or self._explicit_background_class:
@@ -1228,17 +1230,54 @@ class SSDMetaArch(model.DetectionModel):
     tiled_anchor_boxes = tf.tile(tf.expand_dims(anchors, 0), [batch_size, 1, 1])
     tiled_anchors_boxlist = box_list.BoxList(
         tf.reshape(tiled_anchor_boxes, [-1, 4]))
-    decoded_boxes = self._box_coder.decode(
-        tf.reshape(box_encodings, [-1, self._box_coder.code_size]),
+    # print(f'{self._box_coder=}')
+    # self._box_coder=<object_detection.box_coders.faster_rcnn_box_coder.FasterRcnnBoxCoder object at 0x7f7bd89d0460>
+
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L15-L22
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L1197-L1231
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/box_coder.py#L80-L92
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/box_coders/faster_rcnn_box_coder.py#L92-L118
+    def _box_decode(rel_codes:np.ndarray, anchors: box_list.BoxList) -> box_list.BoxList:
+        # TODO make anchors np array?
+        # https://github.com/tensorflow/models/blob/238922e98dd0e8254b5c0921b241a1f5a151782f/research/object_detection/core/box_list.py#L161-L177
+        ycenter_a, xcenter_a, ha, wa = anchors.get_center_coordinates_and_sizes()
+        ycenter_a = ycenter_a.numpy()
+        xcenter_a = xcenter_a.numpy()
+        ha = ha.numpy()
+        wa = wa.numpy()
+        # scale_factors=[1.0, 1.0, 1.0, 1.0]
+        # so omit https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/box_coders/faster_rcnn_box_coder.py#L105-L109
+        # TODO where did the scale_factors come from?
+        ty, tx, th, tw = np.moveaxis(np.transpose(rel_codes), 0, 0)
+        w = np.exp(tw) * wa
+        h = np.exp(th) * ha
+        ycenter = ty * ha + ycenter_a
+        xcenter = tx * wa + xcenter_a
+        ymin = ycenter - h / 2.
+        xmin = xcenter - w / 2.
+        ymax = ycenter + h / 2.
+        xmax = xcenter + w / 2.
+        decoded_codes = np.transpose(np.stack([ymin, xmin, ymax, xmax]))
+        return box_list.BoxList(tf.convert_to_tensor(decoded_codes))
+
+    # replace box decode with np
+    # decoded_boxes = self._box_coder.decode(
+    #     tf.reshape(box_encodings, [-1, self._box_coder.code_size]),
+    #     tiled_anchors_boxlist)
+    decoded_boxes = _box_decode(
+        tf.reshape(box_encodings, [-1, self._box_coder.code_size]).numpy(),
         tiled_anchors_boxlist)
+
     decoded_keypoints = None
-    if decoded_boxes.has_field(fields.BoxListFields.keypoints):
-      decoded_keypoints = decoded_boxes.get_field(
-          fields.BoxListFields.keypoints)
-      num_keypoints = decoded_keypoints.get_shape()[1]
-      decoded_keypoints = tf.reshape(
-          decoded_keypoints,
-          tf.stack([combined_shape[0], combined_shape[1], num_keypoints, 2]))
+    # print(f'{decoded_boxes.has_field(fields.BoxListFields.keypoints)=}')
+    # decoded_boxes.has_field(fields.BoxListFields.keypoints)=False
+    # if decoded_boxes.has_field(fields.BoxListFields.keypoints):
+    #   decoded_keypoints = decoded_boxes.get_field(
+    #       fields.BoxListFields.keypoints)
+    #   num_keypoints = decoded_keypoints.get_shape()[1]
+    #   decoded_keypoints = tf.reshape(
+    #       decoded_keypoints,
+    #       tf.stack([combined_shape[0], combined_shape[1], num_keypoints, 2]))
     decoded_boxes = tf.reshape(decoded_boxes.get(), tf.stack(
         [combined_shape[0], combined_shape[1], 4]))
     return decoded_boxes, decoded_keypoints
