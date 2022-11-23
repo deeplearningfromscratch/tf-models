@@ -774,13 +774,38 @@ class SSDMetaArch(model.DetectionModel):
             detection_keypoints, 'raw_keypoint_locations')
         additional_fields[fields.BoxListFields.keypoints] = detection_keypoints
 
+      # print(f'{self._compute_clip_window}')
+      # <bound method SSDMetaArch._compute_clip_window of <object_detection.meta_architectures.ssd_meta_arch.SSDMetaArch object at 0x7f257016ea60>>
+      from typing import Tuple
+
+      # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L767-L768
+      # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L486-L523
+      def _compute_clip_window(preprocessed_images: np.ndarray, true_image_shapes: Tuple[int]) -> np.ndarray:
+        # always have true_image_shapes
+        # so remove https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L508-L509
+        # preprocessed_images always have static shape
+        # not use shape_utils.combined_static_and_dynamic_shape https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L511-L512
+
+        # NOTE: channel last order in tf.
+        resized_inputs_shape = np.array(preprocessed_images.shape)
+        true_heights, true_widths, _ = np.moveaxis(true_image_shapes, 0, 1)
+        padded_height = resized_inputs_shape[1].astype(np.float32)
+        padded_width = resized_inputs_shape[2].astype(np.float32)
+        return np.stack(
+            [
+                np.zeros_like(true_heights),
+                np.zeros_like(true_widths), true_heights / padded_height,
+                true_widths / padded_width
+            ],
+            axis=1).astype(np.float32)
+
       (nmsed_boxes, nmsed_scores, nmsed_classes, nmsed_masks,
        nmsed_additional_fields,
        num_detections) = self._non_max_suppression_fn(
            detection_boxes,
            detection_scores,
-           clip_window=self._compute_clip_window(
-               preprocessed_images, true_image_shapes),
+           clip_window=tf.convert_to_tensor(_compute_clip_window(
+               preprocessed_images.numpy(), tuple(true_image_shapes))),
            additional_fields=additional_fields,
            masks=prediction_dict.get('mask_predictions'))
 
