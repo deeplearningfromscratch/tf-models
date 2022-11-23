@@ -583,10 +583,156 @@ class SSDMetaArch(model.DetectionModel):
         feature_maps)
     image_shape = shape_utils.combined_static_and_dynamic_shape(
         preprocessed_inputs)
-    boxlist_list = self._anchor_generator.generate(
-        feature_map_spatial_dims,
-        im_height=image_shape[1],
-        im_width=image_shape[2])
+
+    # print(self._anchor_generator.generate)
+    # <bound method AnchorGenerator.generate of <object_detection.anchor_generators.multiscale_grid_anchor_generator.MultiscaleGridAnchorGenerator object at 0x7fe46c5fb0a0>>
+
+    from typing import List, Tuple
+
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L585-L588
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L38-L45
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/anchor_generators/multiscale_grid_anchor_generator.py#L30-L152
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/anchor_generator.py#L81-L112
+    def _anchor_generate(feature_map_shape_list: List[Tuple[int]], im_height: int, im_width: int) -> box_list.BoxList:
+      # TODO: find the source of anchor grid info
+      # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/anchor_generators/multiscale_grid_anchor_generator.py#L117
+      anchor_grid_info = [
+                          {'level': 3, 'info': [[1.0, 1.2599210498948732, 1.5874010519681994], [1.0, 2.0, 0.5], [32.0, 32.0], [8, 8]]}, 
+                          {'level': 4, 'info': [[1.0, 1.2599210498948732, 1.5874010519681994], [1.0, 2.0, 0.5], [64.0, 64.0], [16, 16]]}, 
+                          {'level': 5, 'info': [[1.0, 1.2599210498948732, 1.5874010519681994], [1.0, 2.0, 0.5], [128.0, 128.0], [32, 32]]}, 
+                          {'level': 6, 'info': [[1.0, 1.2599210498948732, 1.5874010519681994], [1.0, 2.0, 0.5], [256.0, 256.0], [64, 64]]}, 
+                          {'level': 7, 'info': [[1.0, 1.2599210498948732, 1.5874010519681994], [1.0, 2.0, 0.5], [512.0, 512.0], [128, 128]]}
+                          ]
+      anchor_grid_list = []
+      for feat_shape, grid_info in zip(feature_map_shape_list, anchor_grid_info):
+        level = grid_info['level']
+        stride = 2**level
+        scales, aspect_ratios, base_anchor_size, anchor_stride = grid_info['info']
+        feat_h = feat_shape[0]
+        feat_w = feat_shape[1]
+        anchor_offset = [0, 0]
+
+        if im_height % 2.0**level == 0 or im_height == 1:
+          anchor_offset[0] = stride / 2.0
+        if im_width % 2.0**level == 0 or im_width == 1:
+          anchor_offset[1] = stride / 2.0
+
+        from object_detection.anchor_generators import grid_anchor_generator
+
+        (anchor_grid,) = _grid_anchor_generator(feature_map_shape_list=[(feat_h, feat_w)],
+                                                scales=scales, aspect_ratios=aspect_ratios, base_anchor_size=base_anchor_size,
+                                                anchor_stride=anchor_stride,anchor_offset=anchor_offset)
+
+        # TODO: find the source of normalize_coordinates
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/anchor_generators/multiscale_grid_anchor_generator.py#L142
+        # normalize_coordinates = True
+        # check_range = False # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/box_list_ops.py#L845
+        anchor_grid = _to_normalized_coordinates(
+            anchor_grid, im_height, im_width)
+        anchor_grid_list.append(anchor_grid)
+      return anchor_grid_list
+
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/anchor_generators/multiscale_grid_anchor_generator.py#L134
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/anchor_generators/grid_anchor_generator.py#L30-L137
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/anchor_generators/grid_anchor_generator.py#L82-L137
+    def _grid_anchor_generator(feature_map_shape_list: List[Tuple[int, int]], scales: List[float], aspect_ratios: List[float], 
+                               base_anchor_size: List[float] , anchor_stride: List[int], 
+                               anchor_offset: List[int]):
+      grid_height, grid_width = feature_map_shape_list[0]
+      scales_grid, aspect_ratios_grid = _meshgrid(scales, aspect_ratios)
+      scales_grid = tf.reshape(scales_grid, [-1])
+      aspect_ratios_grid = tf.reshape(aspect_ratios_grid, [-1])
+      anchors = _tile_anchors(grid_height,
+                              grid_width,
+                              scales_grid,
+                              aspect_ratios_grid,
+                              base_anchor_size,
+                              anchor_stride,
+                              anchor_offset)
+
+      num_anchors = anchors.num_boxes_static()
+      anchor_indices = tf.zeros([num_anchors])
+      anchors.add_field('feature_map_index', anchor_indices)
+      return [anchors]
+
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/anchor_generators/grid_anchor_generator.py#L120-L121
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/ops.py#L99-L135
+    def _meshgrid(x: List[float], y: List[float]) -> Tuple[np.array]: 
+      x = np.array(x)
+      y = np.array(y)
+      
+      x_exp_shape = _expanded_shape(x.shape, 0, y.ndim)
+      y_exp_shape = _expanded_shape(y.shape, y.ndim, x.ndim)
+
+      xgrid = np.tile(np.reshape(x, x_exp_shape), y_exp_shape).astype(np.float32)
+      ygrid = np.tile(np.reshape(y, y_exp_shape), x_exp_shape).astype(np.float32)
+      return xgrid, ygrid
+    
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/ops.py#L40-L59
+    def _expanded_shape(orig_shape, start_dim, num_dims):
+      start_dim = np.expand_dims(start_dim, 0)
+      # TODO: numpy impl. of tf.slice?
+      before = tf.slice(orig_shape, [0], start_dim)
+      add_shape = np.ones(np.reshape(num_dims, [1])).astype(np.int32)
+      # TODO: numpy impl. of tf.slice?
+      after = tf.slice(orig_shape, start_dim, [-1])
+      new_shape = np.concatenate([before, add_shape, after], 0)
+      return new_shape
+
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/anchor_generators/grid_anchor_generator.py#L124-L130
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/anchor_generators/grid_anchor_generator.py#L140-L199
+    def _tile_anchors(grid_height: int,
+                      grid_width: int,
+                      scales: List[float],
+                      aspect_ratios: List[float],
+                      base_anchor_size: List[float],
+                      anchor_stride: List[int],
+                      anchor_offset: List[int]) -> box_list.BoxList:
+      ratio_sqrts = np.sqrt(aspect_ratios)
+      heights = scales / ratio_sqrts * base_anchor_size[0]
+      widths = scales * ratio_sqrts * base_anchor_size[1]
+
+      y_centers = np.arange(grid_height)
+      y_centers = y_centers * anchor_stride[0] + anchor_offset[0]
+      x_centers = np.arange(grid_width)
+      x_centers = x_centers * anchor_stride[1] + anchor_offset[1]
+      x_centers, y_centers = _meshgrid(x_centers, y_centers)
+
+      widths_grid, x_centers_grid = _meshgrid(widths, x_centers)
+      heights_grid, y_centers_grid = _meshgrid(heights, y_centers)
+      bbox_centers = np.stack([y_centers_grid, x_centers_grid], axis=3)
+      bbox_sizes = np.stack([heights_grid, widths_grid], axis=3)
+      bbox_centers = np.reshape(bbox_centers, [-1, 2])
+      bbox_sizes = np.reshape(bbox_sizes, [-1, 2])
+      bbox_corners = _center_size_bbox_to_corners_bbox(bbox_centers, bbox_sizes)
+      return box_list.BoxList(tf.convert_to_tensor(bbox_corners))
+    
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/anchor_generators/grid_anchor_generator.py#L202-L213
+    def _center_size_bbox_to_corners_bbox(centers: np.array, sizes: np.array) -> np.array:
+      return np.concatenate([centers - .5 * sizes, centers + .5 * sizes], 1)
+    
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/anchor_generators/multiscale_grid_anchor_generator.py#L148-L149
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/box_list_ops.py#L844-L878
+    def _to_normalized_coordinates(boxlist: box_list.BoxList, height: int, width:int) -> box_list.BoxList:
+      return _scale(boxlist, 1 / height, 1 / width)
+    
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/box_list_ops.py#L878
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/box_list_ops.py#L82-L105
+    def _scale(boxlist: box_list.BoxList, y_scale: float, x_scale: float, scope=None) -> box_list.BoxList:
+        y_min, x_min, y_max, x_max = np.split(boxlist.get(), 4, axis=1)
+        y_min = y_scale * y_min
+        y_max = y_scale * y_max
+        x_min = x_scale * x_min
+        x_max = x_scale * x_max
+        scaled_boxlist = box_list.BoxList(tf.convert_to_tensor(np.concatenate((y_min, x_min, y_max, x_max), axis=1)))
+        return box_list_ops._copy_extra_fields(scaled_boxlist, boxlist)
+    
+    # replaced with np anchor generator
+    # boxlist_list = self._anchor_generator.generate(
+    #     feature_map_spatial_dims,
+    #     im_height=image_shape[1],
+    #     im_width=image_shape[2])
+    boxlist_list = _anchor_generate(feature_map_spatial_dims, im_height=image_shape[1], im_width=image_shape[2])
     self._anchors = box_list_ops.concatenate(boxlist_list)
     if self._box_predictor.is_keras_model:
       predictor_results_dict = self._box_predictor(feature_maps)
