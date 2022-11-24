@@ -945,16 +945,306 @@ class SSDMetaArch(model.DetectionModel):
             ],
             axis=1).astype(np.float32)
 
+      # print(f'{self._non_max_suppression_fn=}')
+      # self._non_max_suppression_fn=functools.partial(<function batch_multiclass_non_max_suppression at 0x7fae07ebb9d0>, 
+      #  score_thresh=9.99999993922529e-09, iou_thresh=0.5, max_size_per_class=100, max_total_size=100, 
+      #  use_static_shapes=False, use_class_agnostic_nms=False, max_classes_per_detection=1, soft_nms_sigma=0.0, 
+      #  use_partitioned_nms=False, use_combined_nms=False, change_coordinate_frame=True, use_hard_nms=False, use_cpu_nms=False)
+
+      # replaced with numpy _non_max_supression_fn
+      # (nmsed_boxes, nmsed_scores, nmsed_classes, nmsed_masks,
+      #  nmsed_additional_fields,
+      #  num_detections) = self._non_max_suppression_fn(
+      #      detection_boxes,
+      #      detection_scores,
+      #      clip_window=tf.convert_to_tensor(_compute_clip_window(
+      #          preprocessed_images.numpy(), tuple(true_image_shapes))),
+      #      additional_fields=additional_fields,
+      #      masks=prediction_dict.get('mask_predictions'))
+      
+      import collections
+      from typing import Optional, Dict
+      # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/post_processing.py#L878-L1276
+      def _batch_multiclass_non_max_suppression(boxes: np.array,
+                                    scores: np.array,
+                                    score_thresh: float,
+                                    iou_thresh: float,
+                                    max_size_per_class: int,
+                                    max_total_size: int=0,
+                                    clip_window: Optional[np.array]=None,
+                                    change_coordinate_frame: bool=False,
+                                    num_valid_boxes: Optional[int]=None,
+                                    masks: Optional[np.array]=None,
+                                    additional_fields: Optional[Dict[str, np.array]]=None,
+                                    soft_nms_sigma: float=0.0,
+                                    scope=None,
+                                    use_static_shapes: bool=False,
+                                    use_partitioned_nms: bool=False,
+                                    parallel_iterations: int=32,
+                                    use_class_agnostic_nms: bool=False,
+                                    max_classes_per_detection: int=1,
+                                    use_dynamic_map_fn: bool=False,
+                                    use_combined_nms: bool=False,
+                                    use_hard_nms: bool=False,
+                                    use_cpu_nms: bool=False) -> Tuple[np.array, np.array, np.array, np.array, Dict[str, np.array], np.array]:
+        q = boxes.shape[2]
+        ordered_additional_fields = collections.OrderedDict(sorted(additional_fields.items(), key=lambda item: item[0]))
+        
+        boxes_shape = boxes.shape
+        batch_size = boxes_shape[0]
+        num_anchors = boxes_shape[1]
+
+        num_valid_boxes = np.ones([batch_size], dtype=np.int32) * num_anchors
+        masks_shape = np.stack([batch_size, num_anchors, q, 1, 1])
+        masks = np.zeros(masks_shape)
+
+        num_additional_fields = len(ordered_additional_fields)
+        nms_configs = {'score_thresh': score_thresh, 
+                      'iou_thresh': iou_thresh, 
+                      'max_size_per_class': max_size_per_class, 
+                      'max_total_size': max_total_size, 
+                      'change_coordinate_frame': change_coordinate_frame, 
+                      # 'use_static_shapes': use_static_shapes, 
+                      'use_partitioned_nms': use_partitioned_nms, 
+                      'soft_nms_sigma': soft_nms_sigma, 
+                      'use_hard_nms': use_hard_nms, 
+                      'use_cpu_nms': use_cpu_nms}
+        # for loop impl. of tf.map_fn
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/post_processing.py#L1244-L1249
+        batch_outputs = [_single_image_nms_fn(
+                          per_image_boxes=boxes[i],
+                          per_image_scores=scores[i],
+                          per_image_masks=masks[i],
+                          per_image_clip_window=clip_window[i],
+                          per_image_additional_fields=list(map(dict, zip(*[[(k, v) for v in value] for k, value in ordered_additional_fields.items()])))[i],
+                          per_image_num_valid_boxes=num_valid_boxes[i], 
+                          **nms_configs,
+                          )
+                          for i in range(batch_size)]
+        # convert List[List[np.array]] to List[np.array]
+        batch_outputs = list(map(np.stack, np.stack(batch_outputs, axis=1)))
+        batch_nmsed_boxes = batch_outputs[0]
+        batch_nmsed_scores = batch_outputs[1]
+        batch_nmsed_classes = batch_outputs[2]
+        batch_nmsed_masks = batch_outputs[3]
+        batch_nmsed_values = batch_outputs[4:-1]
+
+        batch_nmsed_additional_fields = {}
+        batch_nmsed_keys = list(ordered_additional_fields.keys())
+        for i in range(len(batch_nmsed_keys)):
+          batch_nmsed_additional_fields[
+              batch_nmsed_keys[i]] = batch_nmsed_values[i]
+
+        batch_num_detections = batch_outputs[-1]
+        batch_nmsed_masks = None
+
+        return (batch_nmsed_boxes, batch_nmsed_scores, batch_nmsed_classes,
+                batch_nmsed_masks, batch_nmsed_additional_fields,
+                batch_num_detections)
+          
+      # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/post_processing.py#L1099-L1232
+      def _single_image_nms_fn(per_image_boxes: np.array,
+                               per_image_scores: np.array,
+                               per_image_masks: np.array,
+                               per_image_clip_window: np.array,
+                               per_image_additional_fields: Dict[str, np.array],
+                               per_image_num_valid_boxes: int,
+                               **kwargs) -> Tuple[np.array, np.array, np.array, np.array, np.array, np.array, int]:
+        q = per_image_boxes.shape[1]
+        num_classes = per_image_scores.shape[1]
+                
+        per_image_boxes = np.reshape(
+            # TODO: find numpy func corresponding to tf.slice
+            tf.slice(per_image_boxes, 3 * [0], np.stack([per_image_num_valid_boxes, -1, -1])), [-1, q, 4])
+        per_image_scores = np.reshape(
+            # TODO: find numpy func corresponding to tf.slice
+            tf.slice(per_image_scores, [0, 0], np.stack([per_image_num_valid_boxes, -1])),
+            [-1, num_classes])
+        per_image_masks = np.reshape(
+            # TODO: find numpy func corresponding to tf.slice
+            tf.slice(per_image_masks, 4 * [0], np.stack([per_image_num_valid_boxes, -1, -1, -1])),
+            [-1, q, int(per_image_masks.shape[2]), int(per_image_masks.shape[3])])
+        for key, array in per_image_additional_fields.items():
+          additional_field_shape = array.shape
+          additional_field_dim = len(additional_field_shape)
+          per_image_additional_fields[key] = np.reshape(
+              # TODO: find numpy func corresponding to tf.slice
+              tf.slice(
+                  per_image_additional_fields[key],
+                  additional_field_dim * [0],
+                  np.stack([per_image_num_valid_boxes] +
+                            (additional_field_dim - 1) * [-1])), [-1] + [
+                                int(dim)
+                                for dim in additional_field_shape[1:]
+                          ])
+        nmsed_boxlist, num_valid_nms_boxes = _multiclass_non_max_suppression(
+          boxes=per_image_boxes,
+          scores=per_image_scores,
+          clip_window=per_image_clip_window,
+          masks=per_image_masks,
+          additional_fields=per_image_additional_fields,
+          **kwargs)
+        
+        max_total_size = kwargs['max_total_size']
+        nmsed_boxlist = box_list_ops.pad_or_clip_box_list(
+            nmsed_boxlist, max_total_size)
+        num_detections = num_valid_nms_boxes
+        nmsed_boxes = nmsed_boxlist.get()
+        nmsed_scores = nmsed_boxlist.get_field(fields.BoxListFields.scores)
+        nmsed_classes = nmsed_boxlist.get_field(fields.BoxListFields.classes)
+        nmsed_masks = nmsed_boxlist.get_field(fields.BoxListFields.masks)
+        nmsed_additional_fields = []
+        
+        for key in sorted(per_image_additional_fields.keys()):
+          nmsed_additional_fields.append(nmsed_boxlist.get_field(key).numpy())
+        
+        return ([nmsed_boxes.numpy(), nmsed_scores.numpy(), nmsed_classes.numpy(), nmsed_masks.numpy()] +
+                nmsed_additional_fields + [num_detections])
+    
+      # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/post_processing.py#L1200-L1215
+      # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/post_processing.py#L422-L651
+      def _multiclass_non_max_suppression(boxes: np.array,
+                                          scores: np.array,
+                                          score_thresh: float,
+                                          iou_thresh: float,
+                                          max_size_per_class: int,
+                                          max_total_size: int=0,
+                                          clip_window: Optional[np.array]=None,
+                                          change_coordinate_frame: bool=False,
+                                          masks: Optional[np.array]=None,
+                                          boundaries: Optional[np.array]=None,
+                                          pad_to_max_output_size: bool=False,
+                                          use_partitioned_nms: bool=False,
+                                          additional_fields: Optional[Dict[str, np.array]]=None,
+                                          soft_nms_sigma: float=0.0,
+                                          use_hard_nms: bool=False,
+                                          use_cpu_nms: bool=False) -> Tuple[box_list.BoxList, int]:
+        
+        num_scores = scores.shape[0]
+        num_classes = scores.shape[1]
+        
+        selected_boxes_list = []
+        num_valid_nms_boxes_cumulative = np.array(0, dtype=np.int64)
+        per_class_boxes_list = np.moveaxis(boxes, 0, 1)
+        per_class_masks_list = np.moveaxis(masks, 0, 1)
+
+        boxes_ids = (range(num_classes) if len(per_class_boxes_list) > 1 else [0] * num_classes)
+        for class_idx, boxes_idx in zip(range(num_classes), boxes_ids):
+          per_class_boxes = per_class_boxes_list[boxes_idx]
+          boxlist_and_class_scores = box_list.BoxList(tf.convert_to_tensor(per_class_boxes))
+          class_scores = np.reshape(
+              # TODO: find numpy func corresponding to tf.slice
+              tf.slice(scores, [0, class_idx], np.stack([num_scores, 1])), [-1])
+
+          boxlist_and_class_scores.add_field(fields.BoxListFields.scores, class_scores)
+          per_class_masks = per_class_masks_list[boxes_idx]
+          boxlist_and_class_scores.add_field(fields.BoxListFields.masks,
+                                            per_class_masks)        
+            
+          for key, tensor in additional_fields.items():
+            boxlist_and_class_scores.add_field(key, tensor)
+
+          nms_result = None
+          selected_scores = None
+          
+          max_selection_size = np.minimum(max_size_per_class, boxlist_and_class_scores.num_boxes())
+          # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/post_processing.py#L583-L589
+          # https://github.com/tensorflow/tensorflow/blob/v2.10.1/tensorflow/python/ops/image_ops_impl.py#L3804-L3891](https://github.com/tensorflow/tensorflow/blob/v2.10.1/tensorflow/python/ops/image_ops_impl.py#L3804-L3891)
+          # https://github.com/tensorflow/tensorflow/blob/c7adce4cb2293b66a96b811a0dcdcfb7e361c23f/tensorflow/core/kernels/image/non_max_suppression_op.cc#L829-L907
+          # https://github.com/tensorflow/tensorflow/blob/c7adce4cb2293b66a96b811a0dcdcfb7e361c23f/tensorflow/core/kernels/image/non_max_suppression_op.cc#L194-L330
+          # TODO: CPP impl?
+          (selected_indices, selected_scores
+          ) = tf.image.non_max_suppression_with_scores(
+              boxlist_and_class_scores.get(),
+              boxlist_and_class_scores.get_field(fields.BoxListFields.scores),
+              max_selection_size,
+              iou_threshold=iou_thresh,
+              score_threshold=score_thresh,
+              soft_nms_sigma=soft_nms_sigma)
+          num_valid_nms_boxes = selected_indices.shape[0]
+          selected_indices = np.concatenate([selected_indices, np.zeros(max_selection_size-num_valid_nms_boxes, dtype=np.int32)], 0)
+          selected_scores = np.concatenate([selected_scores, np.zeros(max_selection_size-num_valid_nms_boxes, dtype=np.float32)], -1)
+          nms_result = box_list_ops.gather(boxlist_and_class_scores, tf.convert_to_tensor(selected_indices))
+        
+          valid_nms_boxes_indices = np.less(np.arange(max_selection_size), num_valid_nms_boxes)
+          
+          nms_result.add_field(
+              fields.BoxListFields.scores,
+              tf.convert_to_tensor(np.where(valid_nms_boxes_indices, selected_scores, -1*np.ones(max_selection_size)))
+              )
+          num_valid_nms_boxes_cumulative += num_valid_nms_boxes
+
+          nms_result.add_field(
+              fields.BoxListFields.classes, 
+              tf.convert_to_tensor((np.zeros_like(nms_result.get_field(fields.BoxListFields.scores)) + class_idx))
+              )
+          selected_boxes_list.append(nms_result)
+        
+        selected_boxes = box_list_ops.concatenate(selected_boxes_list)
+        sorted_boxes = box_list_ops.sort_by_field(selected_boxes, fields.BoxListFields.scores)
+
+        sorted_boxes, num_valid_nms_boxes_cumulative = _clip_window_prune_boxes(
+                                                        sorted_boxes, clip_window, pad_to_max_output_size,
+                                                        change_coordinate_frame)
+        
+        max_total_size = np.minimum(max_total_size, sorted_boxes.num_boxes())
+        sorted_boxes = box_list_ops.gather(sorted_boxes, tf.convert_to_tensor(np.arange(max_total_size)))
+        num_valid_nms_boxes_cumulative = np.where(max_total_size > num_valid_nms_boxes_cumulative,
+                                                  num_valid_nms_boxes_cumulative, max_total_size)
+      
+        sorted_boxes = box_list_ops.gather(sorted_boxes, tf.convert_to_tensor(np.arange(num_valid_nms_boxes_cumulative)))
+        return sorted_boxes, num_valid_nms_boxes_cumulative
+      
+      # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/post_processing.py#L636-L638
+      # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/post_processing.py#L345-L388
+      def _clip_window_prune_boxes(sorted_boxes: box_list.BoxList, clip_window: np.array, 
+                                   pad_to_max_output_size: bool, change_coordinate_frame: bool) -> Tuple[box_list.BoxList, int]:
+        
+        sorted_boxes = box_list_ops.clip_to_window(sorted_boxes, tf.convert_to_tensor(clip_window),
+                                                   filter_nonoverlapping=not pad_to_max_output_size)
+        
+        sorted_boxes_size = sorted_boxes.get().numpy().shape[0]
+        non_zero_box_area = box_list_ops.area(sorted_boxes).numpy().astype(np.bool)
+        sorted_boxes_scores = np.where(
+            non_zero_box_area, sorted_boxes.get_field(fields.BoxListFields.scores).numpy(),
+            -1 * np.ones(sorted_boxes_size))
+        sorted_boxes.add_field(fields.BoxListFields.scores, tf.convert_to_tensor(sorted_boxes_scores))
+        num_valid_nms_boxes_cumulative = np.sum(np.greater_equal(sorted_boxes_scores, 0).astype(np.int32))
+        sorted_boxes = box_list_ops.sort_by_field(sorted_boxes,fields.BoxListFields.scores)
+        sorted_boxes = box_list_ops.change_coordinate_frame(sorted_boxes, tf.convert_to_tensor(clip_window))
+        return sorted_boxes, num_valid_nms_boxes_cumulative
+
+      import functools
+      # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L764-L770
+      # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L129-L134
+      # TODO: where are the default values not specified in configuration?
+      # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/post_processing_builder.py#L58-L59
+      # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/post_processing_builder.py#L70-L109
+      _non_max_suppression_fn = functools.partial(
+        _batch_multiclass_non_max_suppression,
+        score_thresh=9.99999993922529e-09, iou_thresh=0.5, 
+        max_size_per_class=100, max_total_size=100, 
+        use_static_shapes=False, use_class_agnostic_nms=False, 
+        max_classes_per_detection=1, soft_nms_sigma=0.0, 
+        use_partitioned_nms=False, use_combined_nms=False, 
+        change_coordinate_frame=True, use_hard_nms=False, use_cpu_nms=False
+        )
+      
       (nmsed_boxes, nmsed_scores, nmsed_classes, nmsed_masks,
        nmsed_additional_fields,
-       num_detections) = self._non_max_suppression_fn(
+       num_detections) = _non_max_suppression_fn(
            detection_boxes,
            detection_scores,
-           clip_window=tf.convert_to_tensor(_compute_clip_window(
-               preprocessed_images.numpy(), tuple(true_image_shapes))),
+           clip_window=_compute_clip_window(preprocessed_images.numpy(), tuple(true_image_shapes)),
            additional_fields=additional_fields,
            masks=prediction_dict.get('mask_predictions'))
 
+      nmsed_boxes = tf.convert_to_tensor(nmsed_boxes) 
+      nmsed_scores = tf.convert_to_tensor(nmsed_scores)
+      nmsed_classes = tf.convert_to_tensor(nmsed_classes)
+      nmsed_additional_fields = {k: tf.convert_to_tensor(v) for k, v in nmsed_additional_fields.items()}
+      num_detections = tf.convert_to_tensor(num_detections)
+      
       detection_dict = {
           fields.DetectionResultFields.detection_boxes:
               nmsed_boxes,
@@ -1587,3 +1877,4 @@ class SSDMetaArch(model.DetectionModel):
       update_ops.extend(self._feature_extractor.get_updates_for(
           self._feature_extractor.inputs))
     return update_ops
+
