@@ -563,16 +563,115 @@ def eval_input(
         )
     if not isinstance(model_config, model_pb2.DetectionModel):
         raise TypeError("The `model_config` must be a " "model_pb2.DetectionModel.")
+
+    from typing import Optional, Tuple
+
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/image_resizer_builder.py#L87
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/preprocessor.py#L2984-L3094
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/image_resizer_builder.py#L86-L92
+    # TODO: CPP impl tf.image.resize_image?
+    # TODO: numpy transcoding when writting e2e-script
+    def _resize_to_range(image: tf.compat.v2.Tensor,
+                        min_dimension:Optional[int]=None,
+                        max_dimension:Optional[int]=None,
+                        method:tf.image.ResizeMethod=tf.image.ResizeMethod.BILINEAR,
+                        align_corners: bool=False,
+                        pad_to_max_dimension: bool=False,
+                        per_channel_pad_value: Tuple[int, int, int]=(0, 0, 0)):
+  
+        if len(image.get_shape()) != 3:
+            raise ValueError('Image should be 3D tensor')
+
+        def _resize_landscape_image(image):
+            # resize a landscape image
+            return tf.image.resize_images(
+                image, tf.stack([min_dimension, max_dimension]), method=method,
+                align_corners=align_corners, preserve_aspect_ratio=True)
+
+        def _resize_portrait_image(image):
+            # resize a portrait image
+            return tf.image.resize_images(
+                image, tf.stack([max_dimension, min_dimension]), method=method,
+                align_corners=align_corners, preserve_aspect_ratio=True)
+
+        if image.get_shape().is_fully_defined():
+            if image.get_shape()[0] < image.get_shape()[1]:
+                new_image = _resize_landscape_image(image)
+            else:
+                new_image = _resize_portrait_image(image)
+            new_size = tf.constant(new_image.get_shape().as_list())
+        else:
+            new_image = tf.cond(
+                tf.less(tf.shape(image)[0], tf.shape(image)[1]),
+                lambda: _resize_landscape_image(image),
+                lambda: _resize_portrait_image(image))
+            new_size = tf.shape(new_image)
+
+        if pad_to_max_dimension:
+            channels = tf.unstack(new_image, axis=2)
+            if len(channels) != len(per_channel_pad_value):
+                raise ValueError('Number of channels must be equal to the length of '
+                                'per-channel pad value.')
+            new_image = tf.stack(
+                [
+                    tf.pad(  # pylint: disable=g-complex-comprehension
+                        channels[i], [[0, max_dimension - new_size[0]],
+                                        [0, max_dimension - new_size[1]]],
+                        constant_values=per_channel_pad_value[i])
+                    for i in range(len(channels))
+                ],
+                axis=2)
+            new_image.set_shape([max_dimension, max_dimension, len(channels)])
+
+        result = [new_image]
+        result.append(new_size)
+        return result
+                    
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L484
+    # 
+    # print(f'{self._image_resizer_fn=}')
+    # self._image_resizer_fn=functools.partial(<function resize_to_range at 0x7f5d166e6c10>, 
+    #  min_dimension=512, max_dimension=512, method=0, 
+    #  pad_to_max_dimension=True, per_channel_pad_value=(0, 0, 0))
+    #
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L47-L53
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/image_resizer_builder.py#L76-L82
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/image_resizer_builder.py#L86-L92
+    _image_resizer_fn = functools.partial(
+        _resize_to_range,
+        min_dimension=512,
+        max_dimension=512,
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/image_resizer_builder.py#L81
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/image_resizer_builder.py#L37-L38
+        method=tf.image.ResizeMethod.BILINEAR,
+        pad_to_max_dimension=True,
+        per_channel_pad_value=(0, 0, 0))
     
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L10
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L459-L484
     def _preprocess(inputs: tf.compat.v2.Tensor) -> tf.compat.v2.Tensor:
         normalized_inputs = tf.numpy_function(_feature_extractor_preprocess, [inputs], tf.float32)
         normalized_inputs.set_shape([1, None, None, 3])
-        image_resizer_config = config_util.get_image_resizer_config(model_config)
-        image_resizer_fn = image_resizer_builder.build(image_resizer_config)
-        return shape_utils.resize_images_and_return_shapes(
-            tf.convert_to_tensor(normalized_inputs), image_resizer_fn)
+        return _resize_images_and_return_shapes(normalized_inputs, _image_resizer_fn)
+    
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L483-L484
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/shape_utils.py#L471-L499
+    # TODO: numpy transcoding when writting e2e-script
+    # what we should postpone transcoding? reason why?  
+    # NotImplementedError: Cannot convert a symbolic tf.Tensor (ExpandDims:0) to a numpy array. This error may indicate that you're trying to pass a Tensor to a NumPy call, which is not supported.
+    # `_resize_to_range` causes this.
+    def _resize_images_and_return_shapes(inputs: tf.compat.v2.Tensor, image_resizer_fn: functools.partial) -> Tuple[tf.compat.v2.Tensor, tf.compat.v2.Tensor]:
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/shape_utils.py#L492-L497
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/shape_utils.py#L186-L256
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/shape_utils.py#L246
+        outputs = [image_resizer_fn(arg) for arg in tf.unstack(inputs)]
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/shape_utils.py#L251-L255
+        outputs = [tf.stack(output_tuple) for output_tuple in zip(*outputs)]
+        resized_inputs = outputs[0]
+        true_image_shapes = outputs[1]
+
+        return resized_inputs, true_image_shapes
+
 
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L482
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L44
