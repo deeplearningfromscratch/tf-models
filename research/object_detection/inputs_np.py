@@ -20,6 +20,7 @@ from __future__ import print_function
 
 import functools
 
+import numpy as np
 import tensorflow.compat.v1 as tf
 from tensorflow.compat.v1 import estimator as tf_estimator
 from object_detection.builders import dataset_builder
@@ -562,30 +563,31 @@ def eval_input(
         )
     if not isinstance(model_config, model_pb2.DetectionModel):
         raise TypeError("The `model_config` must be a " "model_pb2.DetectionModel.")
-
+    
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L10
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L459-L484
-    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L482
-    #
-    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L84
-    # https://github.com/tensorflow/models/blob/238922e98dd0e8254b5c0921b241a1f5a151782f/research/object_detection/models/ssd_efficientnet_bifpn_feature_extractor.py#L234
-    # https://github.com/tensorflow/models/blob/238922e98dd0e8254b5c0921b241a1f5a151782f/research/object_detection/models/ssd_efficientnet_bifpn_feature_extractor.py#L45
-    # https://github.com/tensorflow/models/blob/238922e98dd0e8254b5c0921b241a1f5a151782f/research/object_detection/models/ssd_efficientnet_bifpn_feature_extractor.py#L190-L209
-    #
-    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/shape_utils.py#L471-L499
-    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/shape_utils.py#L186-L256
-    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L47-L53
-    # https://github.com/tensorflow/models/blob/238922e98dd0e8254b5c0921b241a1f5a151782f/research/object_detection/builders/image_resizer_builder.py#L76-L92
-    # https://github.com/tensorflow/models/blob/238922e98dd0e8254b5c0921b241a1f5a151782f/research/object_detection/builders/image_resizer_builder.py#L81
-    # https://github.com/tensorflow/models/blob/238922e98dd0e8254b5c0921b241a1f5a151782f/research/object_detection/builders/image_resizer_builder.py#L87
-    # https://github.com/tensorflow/models/blob/238922e98dd0e8254b5c0921b241a1f5a151782f/research/object_detection/core/preprocessor.py#L2895-L3005
-    def _np_preprocess():
-        # https://github.com/tensorflow/models/blob/238922e98dd0e8254b5c0921b241a1f5a151782f/research/object_detection/models/ssd_efficientnet_bifpn_feature_extractor.py#L205-L207
-        channel_offset = [0.485, 0.456, 0.406]
-        channel_scale = [0.229, 0.224, 0.225]
-        normalized_inputs = ((inputs / 255.0) - [[channel_offset]]) / [[channel_scale]]
+    def _preprocess(inputs: tf.compat.v2.Tensor) -> tf.compat.v2.Tensor:
+        normalized_inputs = tf.numpy_function(_feature_extractor_preprocess, [inputs], tf.float32)
+        normalized_inputs.set_shape([1, None, None, 3])
+        image_resizer_config = config_util.get_image_resizer_config(model_config)
+        image_resizer_fn = image_resizer_builder.build(image_resizer_config)
+        return shape_utils.resize_images_and_return_shapes(
+            tf.convert_to_tensor(normalized_inputs), image_resizer_fn)
 
-    model_preprocess_fn = model.preprocess
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L482
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L44
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L83-L90
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/models/ssd_efficientnet_bifpn_feature_extractor.py#L198-L217
+    @tf.function(input_signature=[tf.TensorSpec([1, None, None, 3], tf.float32)])
+    def _feature_extractor_preprocess(inputs: np.array) -> np.array:
+      channel_offset = [0.485, 0.456, 0.406]
+      channel_scale = [0.229, 0.224, 0.225]
+      return ((inputs / 255.0) - [[channel_offset]]) / [[channel_scale]]
+    
+    # replaced with numpy
+    # model_preprocess_fn = model.preprocess
+    
+    model_preprocess_fn = _preprocess
 
     def transform_and_pad_input_data_fn(tensor_dict):
         """Combines transform and pad operation."""
