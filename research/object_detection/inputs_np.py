@@ -97,7 +97,8 @@ def assert_or_prune_invalid_boxes(boxes):
 
     return boxlist.get()
 
-
+# https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L883
+# https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L151-L395
 def transform_input_data(
     tensor_dict,
     model_preprocess_fn,
@@ -113,35 +114,10 @@ def transform_input_data(
     image_classes_field_map_empty_to_ones=True,
 ):
     out_tensor_dict = tensor_dict.copy()
-
     input_fields = fields.InputDataFields
-    labeled_classes_field = input_fields.groundtruth_labeled_classes
-    image_classes_field = input_fields.groundtruth_image_classes
-    verified_neg_classes_field = input_fields.groundtruth_verified_neg_classes
-    not_exhaustive_field = input_fields.groundtruth_not_exhaustive_classes
 
-    if (
-        labeled_classes_field in out_tensor_dict
-        and image_classes_field in out_tensor_dict
-    ):
-        raise KeyError(
-            "groundtruth_labeled_classes and groundtruth_image_classes"
-            "are provided by the decoder, but only one should be set."
-        )
-
-    for field, map_empty_to_ones in [
-        (labeled_classes_field, True),
-        (image_classes_field, image_classes_field_map_empty_to_ones),
-        (verified_neg_classes_field, False),
-        (not_exhaustive_field, False),
-    ]:
-        if field in out_tensor_dict:
-            out_tensor_dict[field] = _remove_unrecognized_classes(
-                out_tensor_dict[field], unrecognized_label=-1
-            )
-            out_tensor_dict[field] = convert_labeled_classes_to_k_hot(
-                out_tensor_dict[field], num_classes, map_empty_to_ones
-            )
+    # print(f'{(field in out_tensor_dict)=}')
+    # (field in out_tensor_dict)=False
     # print(f'{input_fields.multiclass_scores in out_tensor_dict=}')
     # print(f'{input_fields.groundtruth_boxes in out_tensor_dict=}')
     # print(f'{retain_original_image=}')
@@ -173,9 +149,15 @@ def transform_input_data(
     # input_fields.groundtruth_boxes in out_tensor_dict=True
 
     if input_fields.groundtruth_boxes in out_tensor_dict:
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L258-L259
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/ops.py#L471-L495
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/ops.py#L495
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/ops.py#L343-L400
         out_tensor_dict = util_ops.filter_groundtruth_with_nan_box_coordinates(
             out_tensor_dict
         )
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L260
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/ops.py#L498-L525
         out_tensor_dict = util_ops.filter_unrecognized_classes(out_tensor_dict)
 
     if retain_original_image:
@@ -201,14 +183,14 @@ def transform_input_data(
         ]
     )
 
-    if input_fields.groundtruth_boxes in tensor_dict:
-        bboxes = out_tensor_dict[input_fields.groundtruth_boxes]
-        boxlist = box_list.BoxList(bboxes)
-        realigned_bboxes = box_list_ops.change_coordinate_frame(boxlist, im_box)
-
-        realigned_boxes_tensor = realigned_bboxes.get()
-        valid_boxes_tensor = assert_or_prune_invalid_boxes(realigned_boxes_tensor)
-        out_tensor_dict[input_fields.groundtruth_boxes] = valid_boxes_tensor
+    bboxes = out_tensor_dict[input_fields.groundtruth_boxes]
+    boxlist = box_list.BoxList(bboxes)
+    realigned_bboxes = box_list_ops.change_coordinate_frame(boxlist, im_box)
+    realigned_boxes_tensor = realigned_bboxes.get()
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L300
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L118-L148
+    valid_boxes_tensor = assert_or_prune_invalid_boxes(realigned_boxes_tensor)
+    out_tensor_dict[input_fields.groundtruth_boxes] = valid_boxes_tensor
 
     out_tensor_dict[input_fields.image] = tf.squeeze(preprocessed_resized_image, axis=0)
     out_tensor_dict[input_fields.true_image_shape] = tf.squeeze(
@@ -224,9 +206,6 @@ def transform_input_data(
     )
     out_tensor_dict.pop(input_fields.multiclass_scores, None)
 
-    groundtruth_confidences = tf.ones_like(
-        zero_indexed_groundtruth_classes, dtype=tf.float32
-    )
     out_tensor_dict[input_fields.groundtruth_confidences] = out_tensor_dict[
         input_fields.groundtruth_classes
     ]
