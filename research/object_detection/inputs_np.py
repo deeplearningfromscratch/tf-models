@@ -217,7 +217,8 @@ def transform_input_data(
 
     return out_tensor_dict
 
-
+# https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L1055-L1064
+# https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L398-L590
 def pad_input_data_to_static_shapes(
     tensor_dict,
     max_num_boxes,
@@ -323,6 +324,8 @@ def pad_input_data_to_static_shapes(
 
     padded_tensor_dict = {}
     for tensor_name in tensor_dict:
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L579-L581
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/shape_utils.py#L121-L160
         padded_tensor_dict[tensor_name] = shape_utils.pad_or_clip_nd(
             tensor_dict[tensor_name], padding_shapes[tensor_name]
         )
