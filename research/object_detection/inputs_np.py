@@ -353,22 +353,22 @@ def _get_labels_dict(input_dict):
 
     optional_label_keys = [
         fields.InputDataFields.groundtruth_confidences,
-        fields.InputDataFields.groundtruth_labeled_classes,
-        fields.InputDataFields.groundtruth_keypoints,
-        fields.InputDataFields.groundtruth_keypoint_depths,
-        fields.InputDataFields.groundtruth_keypoint_depth_weights,
-        fields.InputDataFields.groundtruth_instance_masks,
-        fields.InputDataFields.groundtruth_instance_mask_weights,
+        # fields.InputDataFields.groundtruth_labeled_classes,
+        # fields.InputDataFields.groundtruth_keypoints,
+        # fields.InputDataFields.groundtruth_keypoint_depths,
+        # fields.InputDataFields.groundtruth_keypoint_depth_weights,
+        # fields.InputDataFields.groundtruth_instance_masks,
+        # fields.InputDataFields.groundtruth_instance_mask_weights,
         fields.InputDataFields.groundtruth_area,
         fields.InputDataFields.groundtruth_is_crowd,
         fields.InputDataFields.groundtruth_group_of,
         fields.InputDataFields.groundtruth_difficult,
-        fields.InputDataFields.groundtruth_keypoint_visibilities,
-        fields.InputDataFields.groundtruth_keypoint_weights,
-        fields.InputDataFields.groundtruth_dp_num_points,
-        fields.InputDataFields.groundtruth_dp_part_ids,
-        fields.InputDataFields.groundtruth_dp_surface_coords,
-        fields.InputDataFields.groundtruth_track_ids,
+        # fields.InputDataFields.groundtruth_keypoint_visibilities,
+        # fields.InputDataFields.groundtruth_keypoint_weights,
+        # fields.InputDataFields.groundtruth_dp_num_points,
+        # fields.InputDataFields.groundtruth_dp_part_ids,
+        # fields.InputDataFields.groundtruth_dp_surface_coords,
+        # fields.InputDataFields.groundtruth_track_ids,
         fields.InputDataFields.groundtruth_verified_neg_classes,
         fields.InputDataFields.groundtruth_not_exhaustive_classes,
         fields.InputDataFields.groundtruth_image_classes,
@@ -376,11 +376,21 @@ def _get_labels_dict(input_dict):
 
     for key in optional_label_keys:
         if key in input_dict:
+            # print(key)
+            # groundtruth_confidences
+            # groundtruth_area
+            # groundtruth_is_crowd
+            # groundtruth_group_of
+            # groundtruth_difficult
+            # groundtruth_verified_neg_classes
+            # groundtruth_not_exhaustive_classes
+            # groundtruth_image_classes
             labels_dict[key] = input_dict[key]
-    if fields.InputDataFields.groundtruth_difficult in labels_dict:
-        labels_dict[fields.InputDataFields.groundtruth_difficult] = tf.cast(
-            labels_dict[fields.InputDataFields.groundtruth_difficult], tf.int32
-        )
+    # print(f'{(fields.InputDataFields.groundtruth_difficult in labels_dict)=}')
+    # (fields.InputDataFields.groundtruth_difficult in labels_dict)=True
+    labels_dict[fields.InputDataFields.groundtruth_difficult] = tf.cast(
+        labels_dict[fields.InputDataFields.groundtruth_difficult], tf.int32
+    )
     return labels_dict
 
 
