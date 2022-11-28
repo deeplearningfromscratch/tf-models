@@ -22,23 +22,15 @@ import functools
 
 import numpy as np
 import tensorflow.compat.v1 as tf
-from tensorflow.compat.v1 import estimator as tf_estimator
 from object_detection.builders import dataset_builder
 from object_detection.builders import image_resizer_builder
 from object_detection.builders import model_builder
-from object_detection.builders import preprocessor_builder
 from object_detection.core import box_list
 from object_detection.core import box_list_ops
-from object_detection.core import densepose_ops
-from object_detection.core import keypoint_ops
-from object_detection.core import preprocessor
 from object_detection.core import standard_fields as fields
-from object_detection.data_decoders import tf_example_decoder
 from object_detection.protos import eval_pb2
-from object_detection.protos import image_resizer_pb2
 from object_detection.protos import input_reader_pb2
 from object_detection.protos import model_pb2
-from object_detection.protos import train_pb2
 from object_detection.utils import config_util
 from object_detection.utils import ops as util_ops
 from object_detection.utils import shape_utils
@@ -53,34 +45,6 @@ INPUT_BUILDER_UTIL_MAP = {
     "dataset_build": dataset_builder.build,
     "model_build": model_builder.build,
 }
-
-
-def convert_labeled_classes_to_k_hot(
-    groundtruth_labeled_classes, num_classes, map_empty_to_ones=False
-):
-    # If the input labeled_classes is empty, it assumes all classes are
-    # exhaustively labeled, thus returning an all-one encoding.
-    def true_fn():
-        return tf.sparse_to_dense(
-            groundtruth_labeled_classes - _LABEL_OFFSET,
-            [num_classes],
-            tf.constant(1, dtype=tf.float32),
-            validate_indices=False,
-        )
-
-    def false_fn():
-        return tf.ones(num_classes, dtype=tf.float32)
-
-    if map_empty_to_ones:
-        return tf.cond(tf.size(groundtruth_labeled_classes) > 0, true_fn, false_fn)
-    return true_fn()
-
-
-def _remove_unrecognized_classes(class_ids, unrecognized_label):
-    recognized_indices = tf.squeeze(
-        tf.where(tf.greater(class_ids, unrecognized_label)), -1
-    )
-    return tf.gather(class_ids, recognized_indices)
 
 
 def assert_or_prune_invalid_boxes(boxes):
@@ -458,67 +422,6 @@ def _get_features_dict(input_dict, include_source_id=False):
     # (fields.InputDataFields.context_features_image_id_list in input_dict)=False
 
     return features
-
-
-def create_predict_input_fn(model_config, predict_input_config):
-    """Creates a predict `input` function for `Estimator`.
-
-    Args:
-      model_config: A model_pb2.DetectionModel.
-      predict_input_config: An input_reader_pb2.InputReader.
-
-    Returns:
-      `input_fn` for `Estimator` in PREDICT mode.
-    """
-
-    def _predict_input_fn(params=None):
-        """Decodes serialized tf.Examples and returns `ServingInputReceiver`.
-
-        Args:
-          params: Parameter dictionary passed from the estimator.
-
-        Returns:
-          `ServingInputReceiver`.
-        """
-        del params
-        example = tf.placeholder(dtype=tf.string, shape=[], name="tf_example")
-
-        num_classes = config_util.get_number_of_classes(model_config)
-        model_preprocess_fn = INPUT_BUILDER_UTIL_MAP["model_build"](
-            model_config, is_training=False
-        ).preprocess
-
-        image_resizer_config = config_util.get_image_resizer_config(model_config)
-        image_resizer_fn = image_resizer_builder.build(image_resizer_config)
-
-        transform_fn = functools.partial(
-            transform_input_data,
-            model_preprocess_fn=model_preprocess_fn,
-            image_resizer_fn=image_resizer_fn,
-            num_classes=num_classes,
-            data_augmentation_fn=None,
-        )
-
-        decoder = tf_example_decoder.TfExampleDecoder(
-            load_instance_masks=False,
-            num_additional_channels=predict_input_config.num_additional_channels,
-        )
-        input_dict = transform_fn(decoder.decode(example))
-        images = tf.cast(input_dict[fields.InputDataFields.image], dtype=tf.float32)
-        images = tf.expand_dims(images, axis=0)
-        true_image_shape = tf.expand_dims(
-            input_dict[fields.InputDataFields.true_image_shape], axis=0
-        )
-
-        return tf_estimator.export.ServingInputReceiver(
-            features={
-                fields.InputDataFields.image: images,
-                fields.InputDataFields.true_image_shape: true_image_shape,
-            },
-            receiver_tensors={SERVING_FED_EXAMPLE_KEY: example},
-        )
-
-    return _predict_input_fn
 
 
 def create_eval_input_fn(eval_config, eval_input_config, model_config):
