@@ -615,7 +615,6 @@ def eval_input(
         )
 
     reduce_to_frame_fn = get_reduce_to_frame_fn(eval_input_config, False)
-
     dataset = INPUT_BUILDER_UTIL_MAP["dataset_build"](
         eval_input_config,
         batch_size=params["batch_size"] if params else eval_config.batch_size,
@@ -625,6 +624,34 @@ def eval_input(
     )
     return dataset
 
+from pathlib import Path
+from pycocotools.coco import COCO
+from PIL import Image
+import numpy as np
+
+val_image_dir = Path("dataset/mscoco/val2017")
+val_annotations_file = Path("dataset/mscoco/annotations/instances_val2017.json")
+coco = COCO(val_annotations_file)
+
+def eval_input_np():
+    eval_dataset = dict()
+    for image_id in coco.getImgIds():
+        image = coco.loadImgs(ids=[image_id])[0]
+        features, labels = dict(), dict()
+        features['image'] = tf.convert_to_tensor([np.asarray(Image.open(val_image_dir / image["file_name"]))])
+        h, w = image["height"], image["width"]
+        features["true_iamge_shape"] = tf.convert_to_tensor([[h, w, 3]])
+        features["original_image_spatial_shape"] = tf.convert_to_tensor([[h, w]])
+        features["original_image"] = tf.convert_to_tensor([np.asarray(Image.open(val_image_dir / image["file_name"]))])
+
+        anns = coco.imgToAnns[image_id]
+        labels["num_groundtruth_boxes"] = tf.convert_to_tensor([len(anns)])
+        labels["groundtruth_boxes"] = tf.convert_to_tensor([[subdict['bbox'] for subdict in anns]])
+        labels["groundtruth_classes"] = tf.one_hot([tf.convert_to_tensor([subdict['category_id'] for subdict in anns], dtype=tf.int64)], 90)
+        labels["groundtruth_area"] = tf.convert_to_tensor([[subdict['area'] for subdict in anns]])
+        labels["groundtruth_is_crowd"] = tf.convert_to_tensor([[bool(subdict['iscrowd']) for subdict in anns]])
+        eval_dataset[image_id] = [features, labels]
+    yield eval_dataset
 
 def get_reduce_to_frame_fn(input_reader_config, is_training):
     """Returns a function reducing sequence tensors to single frame tensors.
