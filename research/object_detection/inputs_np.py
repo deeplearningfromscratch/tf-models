@@ -305,18 +305,20 @@ def pad_input_data_to_static_shapes(
 
 def _get_labels_dict(input_dict):
     """Extracts labels dict from input dict."""
+    # do not use fields that are not defined in COCO annotations 
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/dataset_tools/create_coco_tf_record.py#L295-L324
     required_label_keys = [
         fields.InputDataFields.num_groundtruth_boxes,
         fields.InputDataFields.groundtruth_boxes,
         fields.InputDataFields.groundtruth_classes,
-        fields.InputDataFields.groundtruth_weights,
+        # fields.InputDataFields.groundtruth_weights,
     ]
     labels_dict = {}
     for key in required_label_keys:
         labels_dict[key] = input_dict[key]
 
     optional_label_keys = [
-        fields.InputDataFields.groundtruth_confidences,
+        # fields.InputDataFields.groundtruth_confidences,
         # fields.InputDataFields.groundtruth_labeled_classes,
         # fields.InputDataFields.groundtruth_keypoints,
         # fields.InputDataFields.groundtruth_keypoint_depths,
@@ -325,17 +327,17 @@ def _get_labels_dict(input_dict):
         # fields.InputDataFields.groundtruth_instance_mask_weights,
         fields.InputDataFields.groundtruth_area,
         fields.InputDataFields.groundtruth_is_crowd,
-        fields.InputDataFields.groundtruth_group_of,
-        fields.InputDataFields.groundtruth_difficult,
+        # fields.InputDataFields.groundtruth_group_of,
+        # fields.InputDataFields.groundtruth_difficult,
         # fields.InputDataFields.groundtruth_keypoint_visibilities,
         # fields.InputDataFields.groundtruth_keypoint_weights,
         # fields.InputDataFields.groundtruth_dp_num_points,
         # fields.InputDataFields.groundtruth_dp_part_ids,
         # fields.InputDataFields.groundtruth_dp_surface_coords,
         # fields.InputDataFields.groundtruth_track_ids,
-        fields.InputDataFields.groundtruth_verified_neg_classes,
-        fields.InputDataFields.groundtruth_not_exhaustive_classes,
-        fields.InputDataFields.groundtruth_image_classes,
+        # fields.InputDataFields.groundtruth_verified_neg_classes,
+        # fields.InputDataFields.groundtruth_not_exhaustive_classes,
+        # fields.InputDataFields.groundtruth_image_classes,
     ]
 
     for key in optional_label_keys:
@@ -352,9 +354,9 @@ def _get_labels_dict(input_dict):
             labels_dict[key] = input_dict[key]
     # print(f'{(fields.InputDataFields.groundtruth_difficult in labels_dict)=}')
     # (fields.InputDataFields.groundtruth_difficult in labels_dict)=True
-    labels_dict[fields.InputDataFields.groundtruth_difficult] = tf.cast(
-        labels_dict[fields.InputDataFields.groundtruth_difficult], tf.int32
-    )
+    # labels_dict[fields.InputDataFields.groundtruth_difficult] = tf.cast(
+    #     labels_dict[fields.InputDataFields.groundtruth_difficult], tf.int32
+    # )
     return labels_dict
 
 
