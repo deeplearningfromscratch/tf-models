@@ -49,7 +49,6 @@ INPUT_BUILDER_UTIL_MAP = {
 
 def assert_or_prune_invalid_boxes(boxes):
     ymin, xmin, ymax, xmax = tf.split(boxes, num_or_size_splits=4, axis=1)
-
     height_check = tf.Assert(tf.reduce_all(ymax >= ymin), [ymin, ymax])
     width_check = tf.Assert(tf.reduce_all(xmax >= xmin), [xmin, xmax])
 
@@ -170,9 +169,9 @@ def transform_input_data(
     )
     out_tensor_dict.pop(input_fields.multiclass_scores, None)
 
-    out_tensor_dict[input_fields.groundtruth_confidences] = out_tensor_dict[
-        input_fields.groundtruth_classes
-    ]
+    # out_tensor_dict[input_fields.groundtruth_confidences] = out_tensor_dict[
+    #     input_fields.groundtruth_classes
+    # ]
 
     if input_fields.groundtruth_boxes in out_tensor_dict:
         out_tensor_dict[input_fields.num_groundtruth_boxes] = tf.shape(
@@ -633,25 +632,208 @@ val_image_dir = Path("dataset/mscoco/val2017")
 val_annotations_file = Path("dataset/mscoco/annotations/instances_val2017.json")
 coco = COCO(val_annotations_file)
 
-def eval_input_np():
+def eval_input_np(eval_config, eval_input_config, model_config):
+
+    from typing import Optional, Tuple
+
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/image_resizer_builder.py#L87
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/preprocessor.py#L2984-L3094
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/image_resizer_builder.py#L86-L92
+    # TODO: CPP impl tf.image.resize_image?
+    # TODO: numpy transcoding when writting e2e-script
+    def _resize_to_range(image: tf.compat.v2.Tensor,
+                        min_dimension:Optional[int]=None,
+                        max_dimension:Optional[int]=None,
+                        method:tf.image.ResizeMethod=tf.image.ResizeMethod.BILINEAR,
+                        align_corners: bool=False,
+                        pad_to_max_dimension: bool=False,
+                        per_channel_pad_value: Tuple[int, int, int]=(0, 0, 0)):
+  
+        if len(image.get_shape()) != 3:
+            raise ValueError('Image should be 3D tensor')
+
+        def _resize_landscape_image(image):
+            # resize a landscape image
+            return tf.image.resize_images(
+                image, tf.stack([min_dimension, max_dimension]), method=method,
+                align_corners=align_corners, preserve_aspect_ratio=True)
+
+        def _resize_portrait_image(image):
+            # resize a portrait image
+            return tf.image.resize_images(
+                image, tf.stack([max_dimension, min_dimension]), method=method,
+                align_corners=align_corners, preserve_aspect_ratio=True)
+
+        if image.get_shape().is_fully_defined():
+            if image.get_shape()[0] < image.get_shape()[1]:
+                new_image = _resize_landscape_image(image)
+            else:
+                new_image = _resize_portrait_image(image)
+            new_size = tf.constant(new_image.get_shape().as_list())
+        else:
+            new_image = tf.cond(
+                tf.less(tf.shape(image)[0], tf.shape(image)[1]),
+                lambda: _resize_landscape_image(image),
+                lambda: _resize_portrait_image(image))
+            new_size = tf.shape(new_image)
+
+        if pad_to_max_dimension:
+            channels = tf.unstack(new_image, axis=2)
+            if len(channels) != len(per_channel_pad_value):
+                raise ValueError('Number of channels must be equal to the length of '
+                                'per-channel pad value.')
+            new_image = tf.stack(
+                [
+                    tf.pad(  # pylint: disable=g-complex-comprehension
+                        channels[i], [[0, max_dimension - new_size[0]],
+                                        [0, max_dimension - new_size[1]]],
+                        constant_values=per_channel_pad_value[i])
+                    for i in range(len(channels))
+                ],
+                axis=2)
+            new_image.set_shape([max_dimension, max_dimension, len(channels)])
+
+        result = [new_image]
+        result.append(new_size)
+        return result
+                    
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L484
+    # 
+    # print(f'{self._image_resizer_fn=}')
+    # self._image_resizer_fn=functools.partial(<function resize_to_range at 0x7f5d166e6c10>, 
+    #  min_dimension=512, max_dimension=512, method=0, 
+    #  pad_to_max_dimension=True, per_channel_pad_value=(0, 0, 0))
+    #
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L47-L53
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/image_resizer_builder.py#L76-L82
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/image_resizer_builder.py#L86-L92
+    _image_resizer_fn = functools.partial(
+        _resize_to_range,
+        min_dimension=512,
+        max_dimension=512,
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/image_resizer_builder.py#L81
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/image_resizer_builder.py#L37-L38
+        method=tf.image.ResizeMethod.BILINEAR,
+        pad_to_max_dimension=True,
+        per_channel_pad_value=(0, 0, 0))
+    
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L10
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L459-L484
+    def _preprocess(inputs: tf.compat.v2.Tensor) -> tf.compat.v2.Tensor:
+        normalized_inputs = tf.numpy_function(_feature_extractor_preprocess, [inputs], tf.float32)
+        normalized_inputs.set_shape([1, None, None, 3])
+        return _resize_images_and_return_shapes(normalized_inputs, _image_resizer_fn)
+    
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L483-L484
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/shape_utils.py#L471-L499
+    # TODO: numpy transcoding when writting e2e-script
+    # what we should postpone transcoding? reason why?  
+    # NotImplementedError: Cannot convert a symbolic tf.Tensor (ExpandDims:0) to a numpy array. This error may indicate that you're trying to pass a Tensor to a NumPy call, which is not supported.
+    # `_resize_to_range` causes this.
+    def _resize_images_and_return_shapes(inputs: tf.compat.v2.Tensor, image_resizer_fn: functools.partial) -> Tuple[tf.compat.v2.Tensor, tf.compat.v2.Tensor]:
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/shape_utils.py#L492-L497
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/shape_utils.py#L186-L256
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/shape_utils.py#L246
+        outputs = [image_resizer_fn(arg) for arg in tf.unstack(inputs)]
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/shape_utils.py#L251-L255
+        outputs = [tf.stack(output_tuple) for output_tuple in zip(*outputs)]
+        resized_inputs = outputs[0]
+        true_image_shapes = outputs[1]
+
+        return resized_inputs, true_image_shapes
+
+
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L482
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L44
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L83-L90
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/models/ssd_efficientnet_bifpn_feature_extractor.py#L198-L217
+    @tf.function(input_signature=[tf.TensorSpec([1, None, None, 3], tf.float32)])
+    def _feature_extractor_preprocess(inputs: np.array) -> np.array:
+      channel_offset = [0.485, 0.456, 0.406]
+      channel_scale = [0.229, 0.224, 0.225]
+      return ((inputs / 255.0) - [[channel_offset]]) / [[channel_scale]]
+    
+    model_preprocess_fn = _preprocess
+
+    num_classes = config_util.get_number_of_classes(model_config)
+
+    image_resizer_config = config_util.get_image_resizer_config(model_config)
+    image_resizer_fn = image_resizer_builder.build(image_resizer_config)
+    keypoint_type_weight = eval_input_config.keypoint_type_weight or None
+
+    transform_data_fn = functools.partial(
+        transform_input_data,
+        model_preprocess_fn=model_preprocess_fn,
+        image_resizer_fn=image_resizer_fn,
+        num_classes=num_classes,
+        data_augmentation_fn=None,
+        retain_original_image=eval_config.retain_original_images,
+        retain_original_image_additional_channels=eval_config.retain_original_image_additional_channels,
+        keypoint_type_weight=keypoint_type_weight,
+        image_classes_field_map_empty_to_ones=eval_config.image_classes_field_map_empty_to_ones,
+    )
+
     eval_dataset = dict()
+    features = dict()
+    labels = dict()
     for image_id in coco.getImgIds():
         image = coco.loadImgs(ids=[image_id])[0]
-        features, labels = dict(), dict()
-        features['image'] = tf.convert_to_tensor([np.asarray(Image.open(val_image_dir / image["file_name"]))])
+        tensor_dict = dict()
+        img = np.asarray(Image.open(val_image_dir / image["file_name"]).convert("RGB"))
+        tensor_dict['image'] = tf.convert_to_tensor(img)
         h, w = image["height"], image["width"]
-        features["true_iamge_shape"] = tf.convert_to_tensor([[h, w, 3]])
-        features["original_image_spatial_shape"] = tf.convert_to_tensor([[h, w]])
-        features["original_image"] = tf.convert_to_tensor([np.asarray(Image.open(val_image_dir / image["file_name"]))])
-
+        tensor_dict["true_image_shape"] = tf.convert_to_tensor([h, w, 3])
+        tensor_dict["original_image_spatial_shape"] = tf.convert_to_tensor([h, w])
+        tensor_dict["original_image"] = tf.convert_to_tensor(img)
+        
         anns = coco.imgToAnns[image_id]
-        labels["num_groundtruth_boxes"] = tf.convert_to_tensor([len(anns)])
-        labels["groundtruth_boxes"] = tf.convert_to_tensor([[subdict['bbox'] for subdict in anns]])
-        labels["groundtruth_classes"] = tf.one_hot([tf.convert_to_tensor([subdict['category_id'] for subdict in anns], dtype=tf.int64)], 90)
-        labels["groundtruth_area"] = tf.convert_to_tensor([[subdict['area'] for subdict in anns]])
-        labels["groundtruth_is_crowd"] = tf.convert_to_tensor([[bool(subdict['iscrowd']) for subdict in anns]])
+        tensor_dict["num_groundtruth_boxes"] = tf.convert_to_tensor(len(anns))
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/dataset_tools/create_coco_tf_record.py#L128-L134
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/dataset_tools/create_coco_tf_record.py#L207-L222
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/data_decoders/tf_example_decoder.py#L293-L295
+        xmin = []
+        xmax = []
+        ymin = []
+        ymax = []
+        bboxes = []
+        for subdict in anns:
+            (x, y, width, height) = tuple(subdict['bbox'])
+            xmin = float(x) / w
+            xmax = float(x + width) / w
+            ymin = float(y) / h
+            ymax = float(y + height) / h
+            bboxes.append([ymin, xmin, ymax, xmax])
+        if len(bboxes) == 0:
+            continue
+        tensor_dict["groundtruth_boxes"] = tf.convert_to_tensor(bboxes)
+        tensor_dict["groundtruth_classes"] = tf.convert_to_tensor([subdict['category_id'] for subdict in anns], dtype=tf.int64)
+        tensor_dict["groundtruth_area"] = tf.convert_to_tensor([subdict['area'] for subdict in anns])
+        tensor_dict["groundtruth_is_crowd"] = tf.convert_to_tensor([bool(subdict['iscrowd']) for subdict in anns])
+        tensor_dict = pad_input_data_to_static_shapes(
+            tensor_dict=transform_data_fn(tensor_dict),
+            max_num_boxes=eval_input_config.max_number_of_boxes,
+            num_classes=config_util.get_number_of_classes(model_config),
+            spatial_image_shape=config_util.get_spatial_image_size(
+                image_resizer_config
+            ),
+            max_num_context_features=config_util.get_max_num_context_features(
+                model_config
+            ),
+            context_feature_length=config_util.get_context_feature_length(model_config),
+        )
+        features['image'] = tf.expand_dims(tensor_dict["image"], 0)
+        features['true_image_shape'] = tf.expand_dims(tensor_dict["true_image_shape"], 0)
+        features['original_image_spatial_shape'] = tf.expand_dims(tensor_dict["original_image_spatial_shape"], 0)
+        features['original_image'] = tf.expand_dims(tensor_dict["original_image"], 0)
+        features['hash'] = tf.expand_dims(image_id, 0)
+        labels["num_groundtruth_boxes"] = tf.expand_dims(tensor_dict["num_groundtruth_boxes"], 0)
+        labels["groundtruth_boxes"] = tf.expand_dims(tensor_dict["groundtruth_boxes"], 0)
+        labels["groundtruth_classes"] = tf.expand_dims(tensor_dict["groundtruth_classes"], 0)
+        labels["groundtruth_area"] = tf.expand_dims(tensor_dict["groundtruth_area"], 0)
+        labels["groundtruth_is_crowd"] = tf.expand_dims(tensor_dict["groundtruth_is_crowd"], 0)
+        
         eval_dataset[image_id] = [features, labels]
-    yield eval_dataset
+    return  eval_dataset
 
 def get_reduce_to_frame_fn(input_reader_config, is_training):
     """Returns a function reducing sequence tensors to single frame tensors.

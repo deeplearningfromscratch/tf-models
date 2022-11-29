@@ -100,7 +100,7 @@ def eval_continuously(
     #         model=detection_model,
     #     )
     # )
-    eval_input = inputs_np.eval_input_np()
+    eval_input = inputs_np.eval_input_np(eval_config, eval_input_config, model_config)
 
     for latest_checkpoint in tf.train.checkpoints_iterator(
         checkpoint_dir, timeout=timeout, min_interval_secs=wait_interval
@@ -160,9 +160,7 @@ def eager_eval_loop(
 
     strategy = tf.compat.v2.distribute.get_strategy()
 
-    for i, (features, labels) in enumerate(eval_dataset):
-        print(i)
-    # for i, (features, labels) in enumerate(eval_dataset):
+    for i, (features, labels) in enumerate(eval_dataset.values()):
 
         prediction_dict, groundtruth_dict, eval_features = strategy.run(
             compute_eval_dict, args=(detection_model, features, labels)
