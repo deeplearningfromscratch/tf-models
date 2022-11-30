@@ -3,7 +3,7 @@ import copy
 import functools
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import tensorflow.compat.v1 as tf
@@ -149,10 +149,9 @@ def eager_eval_loop(
 
     for i, (features, labels) in enumerate(eval_dataset.values()):
 
-        prediction_dict, groundtruth_dict, eval_features = strategy.run(
-            compute_eval_dict, args=(detection_model, features, labels)
+        prediction_dict, groundtruth_dict, eval_features = compute_eval_dict(
+            detection_model, features, labels
         )
-
         (
             local_prediction_dict,
             local_groundtruth_dict,
@@ -201,21 +200,11 @@ def compute_eval_dict(detection_model, features, labels):
     # copied from https://github.com/deeplearningfromscratch/tf-models/blob/effdet-d0/research/object_detection/validate_efficientdet_d0_tf.py#L209
     # arguments and variables which does not acffect eval mAP might be removed or modified.
 
-    use_tpu = False  # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/model_lib_v2.py#L1028
-    batch_size = 1  # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L189
-    boxes_shape = labels[fields.InputDataFields.groundtruth_boxes].get_shape().as_list()
-    unpad_groundtruth_tensors = (
-        boxes_shape[1] is not None and not use_tpu and batch_size == 1
-    )
     groundtruth_dict = labels
-    labels = model_lib.unstack_batch(
-        labels, unpad_groundtruth_tensors=unpad_groundtruth_tensors
-    )
+
     prediction_dict = _compute_predictions_dicts(
         detection_model,
         features,
-        labels,
-        training_step=None,
     )
     prediction_dict = postprocess(
         prediction_dict,
@@ -239,11 +228,11 @@ def compute_eval_dict(detection_model, features, labels):
 
 
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/model_lib_v2.py#L54-L186
-def _compute_predictions_dicts(model, features, labels, training_step=None):
+def _compute_predictions_dicts(model, features):
     # copied from https://github.com/deeplearningfromscratch/tf-models/blob/effdet-d0/research/object_detection/validate_efficientdet_d0_tf.py#L250
     # arguments and variables which does not acffect eval mAP might be removed or modified.
-    model_lib.provide_groundtruth(model, labels, training_step=training_step)
     preprocessed_images = features[fields.InputDataFields.image]
+    preprocessed_images = tf.convert_to_tensor(preprocessed_images)
 
     prediction_dict = predict(preprocessed_images, model)
     prediction_dict = ops.bfloat16_to_float32_nested(prediction_dict)
@@ -1129,22 +1118,6 @@ val_image_dir = Path("dataset/mscoco/val2017")
 val_annotations_file = Path("dataset/mscoco/annotations/instances_val2017.json")
 coco = COCO(val_annotations_file)
 
-# https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L118-L148
-def assert_or_prune_invalid_boxes(boxes):
-    # copied from https://github.com/deeplearningfromscratch/tf-models/blob/effdet-d0/research/object_detection/inputs_np.py#L50
-    # arguments and variables which does not acffect eval mAP might be removed or modified.
-    ymin, xmin, ymax, xmax = tf.split(boxes, num_or_size_splits=4, axis=1)
-    height_check = tf.Assert(tf.reduce_all(ymax >= ymin), [ymin, ymax])
-    width_check = tf.Assert(tf.reduce_all(xmax >= xmin), [xmin, xmax])
-
-    with tf.control_dependencies([height_check, width_check]):
-        boxes_tensor = tf.concat([ymin, xmin, ymax, xmax], axis=1)
-        boxlist = box_list.BoxList(boxes_tensor)
-        # TODO(b/149221748) Remove pruning when XLA supports assertions.
-        boxlist = box_list_ops.prune_small_boxes(boxlist, 0)
-
-    return boxlist.get()
-
 
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/image_resizer_builder.py#L87
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/preprocessor.py#L2984-L3094
@@ -1267,10 +1240,10 @@ def _resize_images_and_return_shapes(
 def transform_input_data(
     tensor_dict: Dict[str, np.ndarray],
     model_preprocess_fn,
-    image_resizer_fn,
-    num_classes,
-    retain_original_image=True,
-):
+    image_resizer_fn: functools.partial,
+    num_classes: int,
+    retain_original_image: bool = True,
+) -> Dict[str, Union[np.ndarray, List]]:
     # copied from https://github.com/deeplearningfromscratch/tf-models/blob/effdet-d0/research/object_detection/inputs_np.py#L65
     # arguments and variables which does not acffect eval mAP might be removed or modified.
 
@@ -1291,12 +1264,12 @@ def transform_input_data(
     preprocessed_shape = preprocessed_resized_image.shape
     new_height, new_width = preprocessed_shape[1], preprocessed_shape[2]
 
-    im_box = tf.stack(
+    im_box = np.stack(
         [
             0.0,
             0.0,
-            tf.to_float(new_height) / tf.to_float(true_image_shape[0, 0]),
-            tf.to_float(new_width) / tf.to_float(true_image_shape[0, 1]),
+            float(new_height) / float(true_image_shape[0, 0]),
+            float(new_width) / float(true_image_shape[0, 1]),
         ]
     )
 
@@ -1305,30 +1278,22 @@ def transform_input_data(
     boxlist = box_list.BoxList(bboxes)
     realigned_bboxes = box_list_ops.change_coordinate_frame(boxlist, im_box)
     realigned_boxes_tensor = realigned_bboxes.get()
-    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L300
-    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L118-L148
-    valid_boxes_tensor = assert_or_prune_invalid_boxes(realigned_boxes_tensor)
-    out_tensor_dict[input_fields.groundtruth_boxes] = valid_boxes_tensor
+    out_tensor_dict[input_fields.groundtruth_boxes] = realigned_boxes_tensor.numpy()
 
-    out_tensor_dict[input_fields.image] = tf.squeeze(preprocessed_resized_image, axis=0)
-    out_tensor_dict[input_fields.true_image_shape] = tf.squeeze(
+    out_tensor_dict[input_fields.image] = np.squeeze(preprocessed_resized_image, axis=0)
+    out_tensor_dict[input_fields.true_image_shape] = np.squeeze(
         true_image_shape, axis=0
     )
 
     zero_indexed_groundtruth_classes = (
         out_tensor_dict[input_fields.groundtruth_classes] - _LABEL_OFFSET
     )
-
-    out_tensor_dict[input_fields.groundtruth_classes] = tf.one_hot(
-        zero_indexed_groundtruth_classes, num_classes
+    out_tensor_dict[input_fields.groundtruth_classes] = np.eye(num_classes)[
+        zero_indexed_groundtruth_classes.reshape(-1)
+    ]
+    out_tensor_dict[input_fields.num_groundtruth_boxes] = np.array(
+        out_tensor_dict[input_fields.groundtruth_boxes].shape[0], dtype=np.int32
     )
-    out_tensor_dict.pop(input_fields.multiclass_scores, None)
-
-    if input_fields.groundtruth_boxes in out_tensor_dict:
-        out_tensor_dict[input_fields.num_groundtruth_boxes] = tf.shape(
-            out_tensor_dict[input_fields.groundtruth_boxes]
-        )[0]
-
     return out_tensor_dict
 
 
@@ -1443,16 +1408,6 @@ def eval_input_np(model_config):
         labels["groundtruth_area"] = np.expand_dims(tensor_dict["groundtruth_area"], 0)
         labels["groundtruth_is_crowd"] = np.expand_dims(
             tensor_dict["groundtruth_is_crowd"], 0
-        )
-
-        features["image"] = tf.convert_to_tensor(features["image"])
-        labels["groundtruth_boxes"] = tf.convert_to_tensor(labels["groundtruth_boxes"])
-        labels["groundtruth_classes"] = tf.convert_to_tensor(
-            labels["groundtruth_classes"]
-        )
-        labels["groundtruth_area"] = tf.convert_to_tensor(labels["groundtruth_area"])
-        labels["groundtruth_is_crowd"] = tf.convert_to_tensor(
-            labels["groundtruth_is_crowd"]
         )
 
         eval_dataset[image_id] = [features, labels]
