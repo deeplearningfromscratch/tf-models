@@ -11,7 +11,7 @@ from pycocotools.coco import COCO
 
 from object_detection import eval_util, inputs_np, model_lib
 from object_detection.builders import image_resizer_builder, model_builder
-from object_detection.core import box_list, box_list_ops
+from object_detection.core import box_list, box_list_ops, model
 from object_detection.core import standard_fields as fields
 from object_detection.utils import config_util, label_map_util
 from object_detection.utils import ops
@@ -196,16 +196,17 @@ def eager_eval_loop(
 
 
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/model_lib_v2.py#L896-L926
-def compute_eval_dict(detection_model, features, labels):
+def compute_eval_dict(
+    detection_model: model.DetectionModel,
+    features: Dict[str, np.ndarray],
+    labels: Dict[str, np.ndarray],
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray]]:
     # copied from https://github.com/deeplearningfromscratch/tf-models/blob/effdet-d0/research/object_detection/validate_efficientdet_d0_tf.py#L209
     # arguments and variables which does not acffect eval mAP might be removed or modified.
 
     groundtruth_dict = labels
-
-    prediction_dict = _compute_predictions_dicts(
-        detection_model,
-        features,
-    )
+    preprocessed_images = features[fields.InputDataFields.image]
+    prediction_dict = predict(preprocessed_images, detection_model)
     prediction_dict = postprocess(
         prediction_dict,
         features[fields.InputDataFields.true_image_shape],
@@ -227,27 +228,16 @@ def compute_eval_dict(detection_model, features, labels):
     return prediction_dict, groundtruth_dict, eval_features
 
 
-# https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/model_lib_v2.py#L54-L186
-def _compute_predictions_dicts(model, features):
-    # copied from https://github.com/deeplearningfromscratch/tf-models/blob/effdet-d0/research/object_detection/validate_efficientdet_d0_tf.py#L250
-    # arguments and variables which does not acffect eval mAP might be removed or modified.
-    preprocessed_images = features[fields.InputDataFields.image]
-    preprocessed_images = tf.convert_to_tensor(preprocessed_images)
-
-    prediction_dict = predict(preprocessed_images, model)
-    prediction_dict = ops.bfloat16_to_float32_nested(prediction_dict)
-
-    return prediction_dict
-
-
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L525
-def predict(preprocessed_inputs, model):
+def predict(
+    preprocessed_inputs: np.ndarray, model: model.DetectionModel
+) -> Dict[str, np.ndarray]:
     # copied from https://github.com/deeplearningfromscratch/tf-models/blob/effdet-d0/research/object_detection/meta_architectures/ssd_meta_arch.py#L526
     # arguments and variables which does not acffect eval mAP might be removed or modified.
-    feature_maps = model._feature_extractor(preprocessed_inputs)
+    feature_maps = model._feature_extractor(tf.convert_to_tensor(preprocessed_inputs))
 
     feature_map_spatial_dims = model._get_feature_map_spatial_dims(feature_maps)
-    image_shape = shape_utils.combined_static_and_dynamic_shape(preprocessed_inputs)
+    image_shape = preprocessed_inputs.shape
 
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L585-L588
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L38-L45
@@ -454,22 +444,13 @@ def predict(preprocessed_inputs, model):
     _anchors = box_list_ops.concatenate(boxlist_list)
     predictor_results_dict = model._box_predictor(feature_maps)
     predictions_dict = {
-        "preprocessed_inputs": preprocessed_inputs,
-        "feature_maps": feature_maps,
-        "anchors": _anchors.get(),
-        "final_anchors": tf.tile(
-            tf.expand_dims(_anchors.get(), 0), [image_shape[0], 1, 1]
-        ),
+        "preprocessed_inputs": tf.convert_to_tensor(preprocessed_inputs),
+        "feature_maps": [tf.convert_to_tensor(fm.numpy()) for fm in feature_maps],
+        "anchors": tf.convert_to_tensor(_anchors.get().numpy()),
     }
     for prediction_key, prediction_list in iter(predictor_results_dict.items()):
-        prediction = tf.concat(prediction_list, axis=1)
-        if (
-            prediction_key == "box_encodings"
-            and prediction.shape.ndims == 4
-            and prediction.shape[2] == 1
-        ):
-            prediction = tf.squeeze(prediction, axis=2)
-        predictions_dict[prediction_key] = prediction
+        prediction = np.concatenate(prediction_list, axis=1)
+        predictions_dict[prediction_key] = tf.convert_to_tensor(prediction)
     return predictions_dict
 
 
