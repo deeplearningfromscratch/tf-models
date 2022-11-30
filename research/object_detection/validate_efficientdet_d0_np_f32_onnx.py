@@ -66,7 +66,6 @@ def eval_continuously(
 
     model_config = configs["model"]
     train_input_config = configs["train_input_config"]
-    eval_input_configs = configs["eval_input_configs"]
     eval_on_train_input_config = copy.deepcopy(train_input_config)
     eval_on_train_input_config.sample_1_of_n_examples = (
         sample_1_of_n_eval_on_train_examples
@@ -82,14 +81,13 @@ def eval_continuously(
         )
         eval_on_train_input_config.num_epochs = 1
 
-    eval_input_config = eval_input_configs[eval_index]
     strategy = tf.compat.v2.distribute.get_strategy()
     with strategy.scope():
         detection_model = model_builder.build(
             model_config=model_config, is_training=True
         )
 
-    eval_input = eval_input_np(eval_input_config, model_config)
+    eval_input = eval_input_np(model_config)
 
     for latest_checkpoint in tf.train.checkpoints_iterator(
         checkpoint_dir, timeout=timeout, min_interval_secs=wait_interval
@@ -1282,88 +1280,6 @@ def _resize_images_and_return_shapes(
     return resized_inputs, true_image_shapes
 
 
-# https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L1055-L1064
-# https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L398-L590
-def pad_input_data_to_static_shapes(
-    tensor_dict,
-    max_num_boxes,
-    num_classes,
-    spatial_image_shape=None,
-):
-    # copied from https://github.com/deeplearningfromscratch/tf-models/blob/effdet-d0/research/object_detection/inputs_np.py#L185
-    # arguments and variables which does not acffect eval mAP might be removed or modified.
-
-    if not spatial_image_shape or spatial_image_shape == [-1, -1]:
-        height, width = None, None
-    else:
-        height, width = spatial_image_shape  # pylint: disable=unpacking-non-sequence
-
-    input_fields = fields.InputDataFields
-    num_additional_channels = 0
-    num_channels = 3
-    if input_fields.image in tensor_dict:
-        num_channels = shape_utils.get_dim_as_int(
-            tensor_dict[input_fields.image].shape[2]
-        )
-
-    padding_shapes = {
-        input_fields.image: [height, width, num_channels],
-        input_fields.original_image_spatial_shape: [2],
-        input_fields.image_additional_channels: [
-            height,
-            width,
-            num_additional_channels,
-        ],
-        input_fields.source_id: [],
-        input_fields.filename: [],
-        input_fields.key: [],
-        input_fields.groundtruth_difficult: [max_num_boxes],
-        input_fields.groundtruth_boxes: [max_num_boxes, 4],
-        input_fields.groundtruth_classes: [max_num_boxes, num_classes],
-        input_fields.groundtruth_instance_masks: [max_num_boxes, height, width],
-        input_fields.groundtruth_instance_mask_weights: [max_num_boxes],
-        input_fields.groundtruth_is_crowd: [max_num_boxes],
-        input_fields.groundtruth_group_of: [max_num_boxes],
-        input_fields.groundtruth_area: [max_num_boxes],
-        input_fields.groundtruth_weights: [max_num_boxes],
-        input_fields.groundtruth_confidences: [max_num_boxes, num_classes],
-        input_fields.num_groundtruth_boxes: [],
-        input_fields.groundtruth_label_types: [max_num_boxes],
-        input_fields.groundtruth_label_weights: [max_num_boxes],
-        input_fields.true_image_shape: [3],
-        input_fields.groundtruth_image_classes: [num_classes],
-        input_fields.groundtruth_image_confidences: [num_classes],
-        input_fields.groundtruth_labeled_classes: [num_classes],
-    }
-
-    if input_fields.original_image in tensor_dict:
-        padding_shapes[input_fields.original_image] = [
-            height,
-            width,
-            shape_utils.get_dim_as_int(
-                tensor_dict[input_fields.original_image].shape[2]
-            ),
-        ]
-    if input_fields.groundtruth_verified_neg_classes in tensor_dict:
-        padding_shapes[input_fields.groundtruth_verified_neg_classes] = [num_classes]
-    if input_fields.groundtruth_not_exhaustive_classes in tensor_dict:
-        padding_shapes[input_fields.groundtruth_not_exhaustive_classes] = [num_classes]
-
-    padded_tensor_dict = {}
-    for tensor_name in tensor_dict:
-        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L579-L581
-        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/shape_utils.py#L121-L160
-        padded_tensor_dict[tensor_name] = shape_utils.pad_or_clip_nd(
-            tensor_dict[tensor_name], padding_shapes[tensor_name]
-        )
-
-    if input_fields.num_groundtruth_boxes in padded_tensor_dict:
-        padded_tensor_dict[input_fields.num_groundtruth_boxes] = tf.minimum(
-            padded_tensor_dict[input_fields.num_groundtruth_boxes], max_num_boxes
-        )
-    return padded_tensor_dict
-
-
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L883
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L151-L395
 def transform_input_data(
@@ -1378,18 +1294,6 @@ def transform_input_data(
 
     out_tensor_dict = tensor_dict.copy()
     input_fields = fields.InputDataFields
-
-    if input_fields.groundtruth_boxes in out_tensor_dict:
-        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L258-L259
-        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/ops.py#L471-L495
-        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/ops.py#L495
-        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/ops.py#L343-L400
-        out_tensor_dict = util_ops.filter_groundtruth_with_nan_box_coordinates(
-            out_tensor_dict
-        )
-        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L260
-        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/ops.py#L498-L525
-        out_tensor_dict = util_ops.filter_unrecognized_classes(out_tensor_dict)
 
     if retain_original_image:
         out_tensor_dict[input_fields.original_image] = tf.cast(
@@ -1458,7 +1362,7 @@ def _feature_extractor_preprocess(inputs: np.array) -> np.array:
     return ((inputs / 255.0) - [[channel_offset]]) / [[channel_scale]]
 
 
-def eval_input_np(eval_input_config, model_config):
+def eval_input_np(model_config):
     model_preprocess_fn = _preprocess
 
     num_classes = config_util.get_number_of_classes(model_config)
@@ -1495,21 +1399,19 @@ def eval_input_np(eval_input_config, model_config):
         tensor_dict = dict()
         features = dict()
         labels = dict()
-        import os
-
         # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/dataset_tools/create_coco_tf_record.py#L171-L173
         with tf.gfile.GFile(val_image_dir / image["file_name"], "rb") as fid:
             encoded_jpg = fid.read()
         # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/official/legacy/detection/dataloader/tf_example_decoder.py#L61
-        img = tf.io.decode_image(encoded_jpg, channels=3)
+        img = tf.io.decode_image(encoded_jpg, channels=3).numpy()
         # img = np.asarray(Image.open(val_image_dir / image["file_name"]).convert("RGB"), dtype=np.uint8)
         tensor_dict["image"] = img
         h, w = image["height"], image["width"]
-        tensor_dict["true_image_shape"] = tf.convert_to_tensor([h, w, 3])
-        tensor_dict["original_image_spatial_shape"] = tf.convert_to_tensor([h, w])
+        tensor_dict["true_image_shape"] = [h, w, 3]
+        tensor_dict["original_image_spatial_shape"] = [h, w]
 
         anns = coco.imgToAnns[image_id]
-        tensor_dict["num_groundtruth_boxes"] = tf.convert_to_tensor(len(anns))
+        tensor_dict["num_groundtruth_boxes"] = len(anns)
         # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/dataset_tools/create_coco_tf_record.py#L128-L134
         # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/dataset_tools/create_coco_tf_record.py#L207-L222
         # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/data_decoders/tf_example_decoder.py#L293-L295
@@ -1525,59 +1427,52 @@ def eval_input_np(eval_input_config, model_config):
             ymin = float(y) / h
             ymax = float(y + height) / h
             bboxes.append([ymin, xmin, ymax, xmax])
-        tensor_dict["groundtruth_boxes"] = tf.convert_to_tensor(bboxes)
-        tensor_dict["groundtruth_classes"] = tf.convert_to_tensor(
-            [subdict["category_id"] for subdict in anns], dtype=tf.int64
-        )
-        tensor_dict["groundtruth_area"] = tf.convert_to_tensor(
-            [subdict["area"] for subdict in anns]
-        )
-        tensor_dict["groundtruth_is_crowd"] = tf.convert_to_tensor(
-            [bool(subdict["iscrowd"]) for subdict in anns]
-        )
+        tensor_dict["groundtruth_boxes"] = np.asarray(bboxes, dtype=np.float32)
+        tensor_dict["groundtruth_classes"] = np.asarray([subdict["category_id"] for subdict in anns], dtype=np.int64)
+        tensor_dict["groundtruth_area"] = np.asarray([subdict["area"] for subdict in anns], dtype=np.float32)
+        tensor_dict["groundtruth_is_crowd"] = np.asarray([bool(subdict["iscrowd"]) for subdict in anns], dtype=bool)
         if len(anns) == 0:
-            tensor_dict["groundtruth_boxes"] = tf.convert_to_tensor(
-                np.empty((0, 4)), dtype=tf.float32
-            )
-            tensor_dict["groundtruth_classes"] = tf.convert_to_tensor(
-                np.empty(0), dtype=tf.int64
-            )
-            tensor_dict["groundtruth_area"] = tf.convert_to_tensor(
-                np.empty(0), dtype=tf.float32
-            )
-            tensor_dict["groundtruth_is_crowd"] = tf.convert_to_tensor(
-                np.empty(0), dtype=bool
-            )
-        tensor_dict = pad_input_data_to_static_shapes(
-            tensor_dict=transform_data_fn(tensor_dict),
-            max_num_boxes=eval_input_config.max_number_of_boxes,
-            num_classes=config_util.get_number_of_classes(model_config),
-            spatial_image_shape=config_util.get_spatial_image_size(
-                image_resizer_config
-            ),
-        )
-        features["image"] = tf.expand_dims(tensor_dict["image"], 0)
-        features["hash"] = tf.expand_dims(image_id, 0)
-        features["true_image_shape"] = tf.expand_dims(
+            tensor_dict["groundtruth_boxes"] = np.empty((0, 4), dtype=np.float32)
+            tensor_dict["groundtruth_classes"] = np.empty(0, dtype=np.int64)
+            tensor_dict["groundtruth_area"] = np.empty(0, dtype=np.float32)
+            tensor_dict["groundtruth_is_crowd"] = np.empty(0, dtype=bool)
+        
+        tensor_dict["image"] = tf.convert_to_tensor(tensor_dict["image"])
+        tensor_dict["groundtruth_boxes"] = tf.convert_to_tensor(tensor_dict["groundtruth_boxes"]) 
+        tensor_dict["groundtruth_classes"] = tf.convert_to_tensor(tensor_dict["groundtruth_classes"]) 
+        tensor_dict["groundtruth_area"] = tf.convert_to_tensor(tensor_dict["groundtruth_area"]) 
+        tensor_dict["groundtruth_is_crowd"] = tf.convert_to_tensor(tensor_dict["groundtruth_is_crowd"]) 
+        
+        tensor_dict = transform_data_fn(tensor_dict)
+
+        features["image"] = np.expand_dims(tensor_dict["image"], 0)
+        features["hash"] = np.expand_dims(image_id, 0)
+        features["true_image_shape"] = np.expand_dims(
             tensor_dict["true_image_shape"], 0
         )
-        features["original_image_spatial_shape"] = tf.expand_dims(
+        features["original_image_spatial_shape"] = np.expand_dims(
             tensor_dict["original_image_spatial_shape"], 0
         )
-        features["original_image"] = tf.expand_dims(tensor_dict["original_image"], 0)
-        labels["num_groundtruth_boxes"] = tf.expand_dims(
+        features["original_image"] = np.expand_dims(tensor_dict["original_image"], 0)
+        labels["num_groundtruth_boxes"] = np.expand_dims(
             tensor_dict["num_groundtruth_boxes"], 0
         )
-        labels["groundtruth_boxes"] = tf.expand_dims(
+        labels["groundtruth_boxes"] = np.expand_dims(
             tensor_dict["groundtruth_boxes"], 0
         )
-        labels["groundtruth_classes"] = tf.expand_dims(
+        labels["groundtruth_classes"] = np.expand_dims(
             tensor_dict["groundtruth_classes"], 0
         )
-        labels["groundtruth_area"] = tf.expand_dims(tensor_dict["groundtruth_area"], 0)
-        labels["groundtruth_is_crowd"] = tf.expand_dims(
+        labels["groundtruth_area"] = np.expand_dims(tensor_dict["groundtruth_area"], 0)
+        labels["groundtruth_is_crowd"] = np.expand_dims(
             tensor_dict["groundtruth_is_crowd"], 0
         )
+
+        features["image"] = tf.convert_to_tensor(features["image"])
+        labels["groundtruth_boxes"] = tf.convert_to_tensor(labels["groundtruth_boxes"]) 
+        labels["groundtruth_classes"] = tf.convert_to_tensor(labels["groundtruth_classes"]) 
+        labels["groundtruth_area"] = tf.convert_to_tensor(labels["groundtruth_area"]) 
+        labels["groundtruth_is_crowd"] = tf.convert_to_tensor(labels["groundtruth_is_crowd"]) 
 
         eval_dataset[image_id] = [features, labels]
 
