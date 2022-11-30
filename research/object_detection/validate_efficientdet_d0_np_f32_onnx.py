@@ -1152,24 +1152,22 @@ def assert_or_prune_invalid_boxes(boxes):
 # TODO: CPP impl tf.image.resize_image?
 # TODO: numpy transcoding when writting e2e-script
 def _resize_to_range(
-    image: tf.compat.v2.Tensor,
+    image: np.ndarray,
     min_dimension: Optional[int] = None,
     max_dimension: Optional[int] = None,
     method: tf.image.ResizeMethod = tf.image.ResizeMethod.BILINEAR,
     align_corners: bool = False,
     pad_to_max_dimension: bool = False,
     per_channel_pad_value: Tuple[int, int, int] = (0, 0, 0),
-):
+) -> Tuple[np.ndarray, Tuple[int, int, int]]:
     # copied from https://github.com/deeplearningfromscratch/tf-models/blob/effdet-d0/research/object_detection/inputs_np.py#L462
     # arguments and variables which does not acffect eval mAP might be removed or modified.
-    if len(image.get_shape()) != 3:
-        raise ValueError("Image should be 3D tensor")
 
     def _resize_landscape_image(image):
         # resize a landscape image
         return tf.image.resize_images(
             image,
-            tf.stack([min_dimension, max_dimension]),
+            np.stack([min_dimension, max_dimension]),
             method=method,
             align_corners=align_corners,
             preserve_aspect_ratio=True,
@@ -1179,36 +1177,31 @@ def _resize_to_range(
         # resize a portrait image
         return tf.image.resize_images(
             image,
-            tf.stack([max_dimension, min_dimension]),
+            np.stack([max_dimension, min_dimension]),
             method=method,
             align_corners=align_corners,
             preserve_aspect_ratio=True,
         )
 
-    if image.get_shape().is_fully_defined():
-        if image.get_shape()[0] < image.get_shape()[1]:
-            new_image = _resize_landscape_image(image)
-        else:
-            new_image = _resize_portrait_image(image)
-        new_size = tf.constant(new_image.get_shape().as_list())
+    image = tf.convert_to_tensor(image)
+    if image.shape[0] < image.shape[1]:
+        new_image = _resize_landscape_image(image)
     else:
-        new_image = tf.cond(
-            tf.less(tf.shape(image)[0], tf.shape(image)[1]),
-            lambda: _resize_landscape_image(image),
-            lambda: _resize_portrait_image(image),
-        )
-        new_size = tf.shape(new_image)
+        new_image = _resize_portrait_image(image)
+    new_image = new_image.numpy()
+    new_size = new_image.shape
 
     if pad_to_max_dimension:
-        channels = tf.unstack(new_image, axis=2)
+        # TODO: consider channel first case
+        channels = np.moveaxis(new_image, 2, 0)
         if len(channels) != len(per_channel_pad_value):
             raise ValueError(
                 "Number of channels must be equal to the length of "
                 "per-channel pad value."
             )
-        new_image = tf.stack(
+        new_image = np.stack(
             [
-                tf.pad(  # pylint: disable=g-complex-comprehension
+                np.pad(  # pylint: disable=g-complex-comprehension
                     channels[i],
                     [
                         [0, max_dimension - new_size[0]],
@@ -1220,7 +1213,6 @@ def _resize_to_range(
             ],
             axis=2,
         )
-        new_image.set_shape([max_dimension, max_dimension, len(channels)])
 
     result = [new_image]
     result.append(new_size)
@@ -1246,44 +1238,34 @@ _image_resizer_fn = functools.partial(
 
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L10
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L459-L484
-def _preprocess(inputs: tf.compat.v2.Tensor) -> tf.compat.v2.Tensor:
-    normalized_inputs = tf.numpy_function(
-        _feature_extractor_preprocess, [inputs], tf.float32
-    )
-    # copied from https://github.com/deeplearningfromscratch/tf-models/blob/effdet-d0/research/object_detection/inputs_np.py#L540
-    # arguments and variables which does not acffect eval mAP might be removed or modified.
-    normalized_inputs.set_shape([1, None, None, 3])
+def _preprocess(inputs: np.ndarray) -> np.ndarray:
+    normalized_inputs = _feature_extractor_preprocess(inputs)
     return _resize_images_and_return_shapes(normalized_inputs, _image_resizer_fn)
 
 
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L483-L484
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/shape_utils.py#L471-L499
-# TODO: numpy transcoding when writting e2e-script
-# what we should postpone transcoding? reason why?
-# NotImplementedError: Cannot convert a symbolic tf.Tensor (ExpandDims:0) to a numpy array. This error may indicate that you're trying to pass a Tensor to a NumPy call, which is not supported.
-# `_resize_to_range` causes this.
 def _resize_images_and_return_shapes(
-    inputs: tf.compat.v2.Tensor, image_resizer_fn: functools.partial
-) -> Tuple[tf.compat.v2.Tensor, tf.compat.v2.Tensor]:
+    inputs: np.ndarray, image_resizer_fn: functools.partial
+) -> Tuple[np.ndarray, np.ndarray]:
     # copied from https://github.com/deeplearningfromscratch/tf-models/blob/effdet-d0/research/object_detection/inputs_np.py#L551
     # arguments and variables which does not acffect eval mAP might be removed or modified.
 
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/shape_utils.py#L492-L497
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/shape_utils.py#L186-L256
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/shape_utils.py#L246
-    outputs = [image_resizer_fn(arg) for arg in tf.unstack(inputs)]
+    outputs = [image_resizer_fn(arg) for arg in np.moveaxis(inputs, 0, 0)]
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/shape_utils.py#L251-L255
-    outputs = [tf.stack(output_tuple) for output_tuple in zip(*outputs)]
+    outputs = [np.stack(output_tuple) for output_tuple in zip(*outputs)]
     resized_inputs = outputs[0]
     true_image_shapes = outputs[1]
-
     return resized_inputs, true_image_shapes
 
 
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L883
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L151-L395
 def transform_input_data(
-    tensor_dict,
+    tensor_dict: Dict[str, np.ndarray],
     model_preprocess_fn,
     image_resizer_fn,
     num_classes,
@@ -1296,17 +1278,17 @@ def transform_input_data(
     input_fields = fields.InputDataFields
 
     if retain_original_image:
-        out_tensor_dict[input_fields.original_image] = tf.cast(
-            image_resizer_fn(out_tensor_dict[input_fields.image], None)[0], tf.uint8
-        )
+        out_tensor_dict[input_fields.original_image] = image_resizer_fn(
+            out_tensor_dict[input_fields.image]
+        )[0].astype(np.uint8)
 
     # Apply model preprocessing ops and resize instance masks.
     image = out_tensor_dict[input_fields.image]
     preprocessed_resized_image, true_image_shape = model_preprocess_fn(
-        tf.expand_dims(tf.cast(image, dtype=tf.float32), axis=0)
+        np.expand_dims(image.astype(np.float32), axis=0)
     )
 
-    preprocessed_shape = tf.shape(preprocessed_resized_image)
+    preprocessed_shape = preprocessed_resized_image.shape
     new_height, new_width = preprocessed_shape[1], preprocessed_shape[2]
 
     im_box = tf.stack(
@@ -1319,6 +1301,7 @@ def transform_input_data(
     )
 
     bboxes = out_tensor_dict[input_fields.groundtruth_boxes]
+    bboxes = tf.convert_to_tensor(bboxes)
     boxlist = box_list.BoxList(bboxes)
     realigned_bboxes = box_list_ops.change_coordinate_frame(boxlist, im_box)
     realigned_boxes_tensor = realigned_bboxes.get()
@@ -1353,8 +1336,7 @@ def transform_input_data(
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L44
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L83-L90
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/models/ssd_efficientnet_bifpn_feature_extractor.py#L198-L217
-@tf.function(input_signature=[tf.TensorSpec([1, None, None, 3], tf.float32)])
-def _feature_extractor_preprocess(inputs: np.array) -> np.array:
+def _feature_extractor_preprocess(inputs: np.ndarray) -> np.ndarray:
     # copied from https://github.com/deeplearningfromscratch/tf-models/blob/effdet-d0/research/object_detection/inputs_np.py#L569
     # arguments and variables which does not acffect eval mAP might be removed or modified.
     channel_offset = [0.485, 0.456, 0.406]
@@ -1363,17 +1345,12 @@ def _feature_extractor_preprocess(inputs: np.array) -> np.array:
 
 
 def eval_input_np(model_config):
-    model_preprocess_fn = _preprocess
-
     num_classes = config_util.get_number_of_classes(model_config)
-
-    image_resizer_config = config_util.get_image_resizer_config(model_config)
-    image_resizer_fn = image_resizer_builder.build(image_resizer_config)
 
     transform_data_fn = functools.partial(
         transform_input_data,
-        model_preprocess_fn=model_preprocess_fn,
-        image_resizer_fn=image_resizer_fn,
+        model_preprocess_fn=_preprocess,
+        image_resizer_fn=_image_resizer_fn,
         num_classes=num_classes,
     )
     eval_dataset = dict()
@@ -1428,21 +1405,21 @@ def eval_input_np(model_config):
             ymax = float(y + height) / h
             bboxes.append([ymin, xmin, ymax, xmax])
         tensor_dict["groundtruth_boxes"] = np.asarray(bboxes, dtype=np.float32)
-        tensor_dict["groundtruth_classes"] = np.asarray([subdict["category_id"] for subdict in anns], dtype=np.int64)
-        tensor_dict["groundtruth_area"] = np.asarray([subdict["area"] for subdict in anns], dtype=np.float32)
-        tensor_dict["groundtruth_is_crowd"] = np.asarray([bool(subdict["iscrowd"]) for subdict in anns], dtype=bool)
+        tensor_dict["groundtruth_classes"] = np.asarray(
+            [subdict["category_id"] for subdict in anns], dtype=np.int64
+        )
+        tensor_dict["groundtruth_area"] = np.asarray(
+            [subdict["area"] for subdict in anns], dtype=np.float32
+        )
+        tensor_dict["groundtruth_is_crowd"] = np.asarray(
+            [bool(subdict["iscrowd"]) for subdict in anns], dtype=bool
+        )
         if len(anns) == 0:
             tensor_dict["groundtruth_boxes"] = np.empty((0, 4), dtype=np.float32)
             tensor_dict["groundtruth_classes"] = np.empty(0, dtype=np.int64)
             tensor_dict["groundtruth_area"] = np.empty(0, dtype=np.float32)
             tensor_dict["groundtruth_is_crowd"] = np.empty(0, dtype=bool)
-        
-        tensor_dict["image"] = tf.convert_to_tensor(tensor_dict["image"])
-        tensor_dict["groundtruth_boxes"] = tf.convert_to_tensor(tensor_dict["groundtruth_boxes"]) 
-        tensor_dict["groundtruth_classes"] = tf.convert_to_tensor(tensor_dict["groundtruth_classes"]) 
-        tensor_dict["groundtruth_area"] = tf.convert_to_tensor(tensor_dict["groundtruth_area"]) 
-        tensor_dict["groundtruth_is_crowd"] = tf.convert_to_tensor(tensor_dict["groundtruth_is_crowd"]) 
-        
+
         tensor_dict = transform_data_fn(tensor_dict)
 
         features["image"] = np.expand_dims(tensor_dict["image"], 0)
@@ -1469,10 +1446,14 @@ def eval_input_np(model_config):
         )
 
         features["image"] = tf.convert_to_tensor(features["image"])
-        labels["groundtruth_boxes"] = tf.convert_to_tensor(labels["groundtruth_boxes"]) 
-        labels["groundtruth_classes"] = tf.convert_to_tensor(labels["groundtruth_classes"]) 
-        labels["groundtruth_area"] = tf.convert_to_tensor(labels["groundtruth_area"]) 
-        labels["groundtruth_is_crowd"] = tf.convert_to_tensor(labels["groundtruth_is_crowd"]) 
+        labels["groundtruth_boxes"] = tf.convert_to_tensor(labels["groundtruth_boxes"])
+        labels["groundtruth_classes"] = tf.convert_to_tensor(
+            labels["groundtruth_classes"]
+        )
+        labels["groundtruth_area"] = tf.convert_to_tensor(labels["groundtruth_area"])
+        labels["groundtruth_is_crowd"] = tf.convert_to_tensor(
+            labels["groundtruth_is_crowd"]
+        )
 
         eval_dataset[image_id] = [features, labels]
 
