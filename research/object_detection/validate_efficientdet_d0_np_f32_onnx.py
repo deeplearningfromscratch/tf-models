@@ -2,6 +2,7 @@ import collections
 import copy
 import functools
 import os
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -243,7 +244,7 @@ def predict(
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/anchor_generator.py#L81-L112
     def _anchor_generate(
         feature_map_shape_list: List[Tuple[int]], im_height: int, im_width: int
-    ) -> box_list.BoxList:
+    ) -> List[np.ndarray]:
         # TODO: find the source of anchor grid info
         # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/anchor_generators/multiscale_grid_anchor_generator.py#L117
         anchor_grid_info = [
@@ -320,7 +321,9 @@ def predict(
             # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/anchor_generators/multiscale_grid_anchor_generator.py#L142
             # normalize_coordinates = True
             # check_range = False # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/box_list_ops.py#L845
-            anchor_grid = _to_normalized_coordinates(anchor_grid, im_height, im_width)
+            anchor_grid = _to_normalized_coordinates(
+                anchor_grid, im_height, im_width
+            )
             anchor_grid_list.append(anchor_grid)
         return anchor_grid_list
 
@@ -334,7 +337,7 @@ def predict(
         base_anchor_size: List[float],
         anchor_stride: List[int],
         anchor_offset: List[int],
-    ):
+    ) -> List[np.ndarray]:
         grid_height, grid_width = feature_map_shape_list[0]
         scales_grid, aspect_ratios_grid = _meshgrid(scales, aspect_ratios)
         scales_grid = tf.reshape(scales_grid, [-1])
@@ -349,9 +352,6 @@ def predict(
             anchor_offset,
         )
 
-        num_anchors = anchors.num_boxes_static()
-        anchor_indices = tf.zeros([num_anchors])
-        anchors.add_field("feature_map_index", anchor_indices)
         return [anchors]
 
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/anchor_generators/grid_anchor_generator.py#L120-L121
@@ -388,7 +388,7 @@ def predict(
         base_anchor_size: List[float],
         anchor_stride: List[int],
         anchor_offset: List[int],
-    ) -> box_list.BoxList:
+    ) -> np.ndarray:
         ratio_sqrts = np.sqrt(aspect_ratios)
         heights = scales / ratio_sqrts * base_anchor_size[0]
         widths = scales * ratio_sqrts * base_anchor_size[1]
@@ -405,46 +405,30 @@ def predict(
         bbox_sizes = np.stack([heights_grid, widths_grid], axis=3)
         bbox_centers = np.reshape(bbox_centers, [-1, 2])
         bbox_sizes = np.reshape(bbox_sizes, [-1, 2])
-        bbox_corners = _center_size_bbox_to_corners_bbox(bbox_centers, bbox_sizes)
-        return box_list.BoxList(tf.convert_to_tensor(bbox_corners))
+        return _center_size_bbox_to_corners_bbox(bbox_centers, bbox_sizes)
 
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/anchor_generators/grid_anchor_generator.py#L202-L213
     def _center_size_bbox_to_corners_bbox(
-        centers: np.array, sizes: np.array
+        centers: np.ndarray, sizes: np.ndarray
     ) -> np.array:
         return np.concatenate([centers - 0.5 * sizes, centers + 0.5 * sizes], 1)
 
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/anchor_generators/multiscale_grid_anchor_generator.py#L148-L149
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/box_list_ops.py#L844-L878
     def _to_normalized_coordinates(
-        boxlist: box_list.BoxList, height: int, width: int
-    ) -> box_list.BoxList:
-        return _scale(boxlist, 1 / height, 1 / width)
-
-    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/box_list_ops.py#L878
-    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/box_list_ops.py#L82-L105
-    def _scale(
-        boxlist: box_list.BoxList, y_scale: float, x_scale: float, scope=None
-    ) -> box_list.BoxList:
-        y_min, x_min, y_max, x_max = np.split(boxlist.get(), 4, axis=1)
-        y_min = y_scale * y_min
-        y_max = y_scale * y_max
-        x_min = x_scale * x_min
-        x_max = x_scale * x_max
-        scaled_boxlist = box_list.BoxList(
-            tf.convert_to_tensor(np.concatenate((y_min, x_min, y_max, x_max), axis=1))
-        )
-        return box_list_ops._copy_extra_fields(scaled_boxlist, boxlist)
+        bbox: np.ndarray, height: int, width: int
+    ) -> np.ndarray:
+        return _scale(bbox, 1 / height, 1 / width)
 
     boxlist_list = _anchor_generate(
         feature_map_spatial_dims, im_height=image_shape[1], im_width=image_shape[2]
     )
-    _anchors = box_list_ops.concatenate(boxlist_list)
+    _anchors = np.concatenate(boxlist_list, 0)
     predictor_results_dict = model._box_predictor(feature_maps)
     predictions_dict = {
         "preprocessed_inputs": preprocessed_inputs,
         "feature_maps": [fm.numpy() for fm in feature_maps],
-        "anchors": _anchors.get().numpy(),
+        "anchors": _anchors,
     }
     for prediction_key, prediction_list in iter(predictor_results_dict.items()):
         prediction = np.concatenate(prediction_list, axis=1)
@@ -461,23 +445,26 @@ def _batch_decode(
     combined_shape = box_encodings.shape
     batch_size = combined_shape[0]
     tiled_anchor_boxes = np.tile(np.expand_dims(anchors, 0), [batch_size, 1, 1])
-    tiled_anchors_boxlist = box_list.BoxList(
-        tf.convert_to_tensor(np.reshape(tiled_anchor_boxes, [-1, 4]))
-    )
+    tiled_anchors_boxlist = np.reshape(tiled_anchor_boxes, [-1, 4])
+    
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L15-L22
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L1197-L1231
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/box_coder.py#L80-L92
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/box_coders/faster_rcnn_box_coder.py#L92-L118
     def _box_decode(
-        rel_codes: np.ndarray, anchors: box_list.BoxList
-    ) -> box_list.BoxList:
+        rel_codes: np.ndarray, anchors: np.ndarray
+    ) -> np.ndarray:
         # TODO make anchors np array?
         # https://github.com/tensorflow/models/blob/238922e98dd0e8254b5c0921b241a1f5a151782f/research/object_detection/core/box_list.py#L161-L177
-        ycenter_a, xcenter_a, ha, wa = anchors.get_center_coordinates_and_sizes()
-        ycenter_a = ycenter_a.numpy()
-        xcenter_a = xcenter_a.numpy()
-        ha = ha.numpy()
-        wa = wa.numpy()
+        def _get_center_coordinates_and_sizes(box_corners: np.ndarray) -> np.ndarray:
+            ymin, xmin, ymax, xmax = np.moveaxis(np.transpose(box_corners), 0, 0)
+            width = xmax - xmin
+            height = ymax - ymin
+            ycenter = ymin + height / 2.
+            xcenter = xmin + width / 2.
+            return [ycenter, xcenter, height, width]
+        ycenter_a, xcenter_a, ha, wa = _get_center_coordinates_and_sizes(anchors)
+
         # scale_factors=[1.0, 1.0, 1.0, 1.0]
         # so omit https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/box_coders/faster_rcnn_box_coder.py#L105-L109
         # TODO where did the scale_factors come from?
@@ -490,8 +477,7 @@ def _batch_decode(
         xmin = xcenter - w / 2.0
         ymax = ycenter + h / 2.0
         xmax = xcenter + w / 2.0
-        decoded_codes = np.transpose(np.stack([ymin, xmin, ymax, xmax]))
-        return box_list.BoxList(tf.convert_to_tensor(decoded_codes))
+        return np.transpose(np.stack([ymin, xmin, ymax, xmax]))
 
     decoded_boxes = _box_decode(
         np.reshape(box_encodings, [-1, model._box_coder.code_size]),
@@ -499,7 +485,7 @@ def _batch_decode(
     )
 
     decoded_boxes = np.reshape(
-        decoded_boxes.get(), np.stack([combined_shape[0], combined_shape[1], 4])
+        decoded_boxes, np.stack([combined_shape[0], combined_shape[1], 4])
     )
     return decoded_boxes
 
@@ -535,8 +521,6 @@ def postprocess(
 
     detection_scores = detection_scores_with_background
 
-    additional_fields = {"multiclass_scores": detection_scores_with_background}
-
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L767-L768
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L486-L523
     def _compute_clip_window(
@@ -564,8 +548,8 @@ def postprocess(
 
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/post_processing.py#L878-L1276
     def _batch_multiclass_non_max_suppression(
-        boxes: np.array,
-        scores: np.array,
+        boxes: np.ndarray,
+        scores: np.ndarray,
         score_thresh: float,
         iou_thresh: float,
         max_size_per_class: int,
@@ -573,22 +557,10 @@ def postprocess(
         clip_window: Optional[np.array] = None,
         change_coordinate_frame: bool = False,
         num_valid_boxes: Optional[int] = None,
-        masks: Optional[np.array] = None,
-        additional_fields: Optional[Dict[str, np.array]] = None,
         soft_nms_sigma: float = 0.0,
     ) -> Tuple[np.array, np.array, np.array, np.array, Dict[str, np.array], np.array]:
-        q = boxes.shape[2]
-        ordered_additional_fields = collections.OrderedDict(
-            sorted(additional_fields.items(), key=lambda item: item[0])
-        )
-
         boxes_shape = boxes.shape
         batch_size = boxes_shape[0]
-        num_anchors = boxes_shape[1]
-
-        num_valid_boxes = np.ones([batch_size], dtype=np.int32) * num_anchors
-        masks_shape = np.stack([batch_size, num_anchors, q, 1, 1])
-        masks = np.zeros(masks_shape)
 
         nms_configs = {
             "score_thresh": score_thresh,
@@ -604,20 +576,7 @@ def postprocess(
             _single_image_nms_fn(
                 per_image_boxes=boxes[i],
                 per_image_scores=scores[i],
-                per_image_masks=masks[i],
                 per_image_clip_window=clip_window[i],
-                per_image_additional_fields=list(
-                    map(
-                        dict,
-                        zip(
-                            *[
-                                [(k, v) for v in value]
-                                for k, value in ordered_additional_fields.items()
-                            ]
-                        ),
-                    )
-                )[i],
-                per_image_num_valid_boxes=num_valid_boxes[i],
                 **nms_configs,
             )
             for i in range(batch_size)
@@ -627,166 +586,71 @@ def postprocess(
         batch_nmsed_boxes = batch_outputs[0]
         batch_nmsed_scores = batch_outputs[1]
         batch_nmsed_classes = batch_outputs[2]
-        batch_nmsed_masks = batch_outputs[3]
-        batch_nmsed_values = batch_outputs[4:-1]
-
-        batch_nmsed_additional_fields = {}
-        batch_nmsed_keys = list(ordered_additional_fields.keys())
-        for i in range(len(batch_nmsed_keys)):
-            batch_nmsed_additional_fields[batch_nmsed_keys[i]] = batch_nmsed_values[i]
-
         batch_num_detections = batch_outputs[-1]
-        batch_nmsed_masks = None
 
         return (
             batch_nmsed_boxes,
             batch_nmsed_scores,
             batch_nmsed_classes,
-            batch_nmsed_masks,
-            batch_nmsed_additional_fields,
             batch_num_detections,
         )
 
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/post_processing.py#L1099-L1232
     def _single_image_nms_fn(
-        per_image_boxes: np.array,
-        per_image_scores: np.array,
-        per_image_masks: np.array,
-        per_image_clip_window: np.array,
-        per_image_additional_fields: Dict[str, np.array],
-        per_image_num_valid_boxes: int,
+        per_image_boxes: np.ndarray,
+        per_image_scores: np.ndarray,
+        per_image_clip_window: np.ndarray,
         **kwargs,
-    ) -> Tuple[np.array, np.array, np.array, np.array, np.array, np.array, int]:
-        q = per_image_boxes.shape[1]
-        num_classes = per_image_scores.shape[1]
-
-        per_image_boxes = np.reshape(
-            # TODO: find numpy func corresponding to tf.slice
-            tf.slice(
-                per_image_boxes,
-                3 * [0],
-                np.stack([per_image_num_valid_boxes, -1, -1]),
-            ),
-            [-1, q, 4],
-        )
-        per_image_scores = np.reshape(
-            # TODO: find numpy func corresponding to tf.slice
-            tf.slice(
-                per_image_scores, [0, 0], np.stack([per_image_num_valid_boxes, -1])
-            ),
-            [-1, num_classes],
-        )
-        per_image_masks = np.reshape(
-            # TODO: find numpy func corresponding to tf.slice
-            tf.slice(
-                per_image_masks,
-                4 * [0],
-                np.stack([per_image_num_valid_boxes, -1, -1, -1]),
-            ),
-            [-1, q, int(per_image_masks.shape[2]), int(per_image_masks.shape[3])],
-        )
-        for key, array in per_image_additional_fields.items():
-            additional_field_shape = array.shape
-            additional_field_dim = len(additional_field_shape)
-            per_image_additional_fields[key] = np.reshape(
-                # TODO: find numpy func corresponding to tf.slice
-                tf.slice(
-                    per_image_additional_fields[key],
-                    additional_field_dim * [0],
-                    np.stack(
-                        [per_image_num_valid_boxes] + (additional_field_dim - 1) * [-1]
-                    ),
-                ),
-                [-1] + [int(dim) for dim in additional_field_shape[1:]],
-            )
-        nmsed_boxlist, num_valid_nms_boxes = _multiclass_non_max_suppression(
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        nmsed_boxes, nmsed_scores, nmsed_classes = _multiclass_non_max_suppression(
             boxes=per_image_boxes,
             scores=per_image_scores,
             clip_window=per_image_clip_window,
-            masks=per_image_masks,
-            additional_fields=per_image_additional_fields,
             **kwargs,
         )
 
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/box_list_ops.py#L1069-L1089
         max_total_size = kwargs["max_total_size"]
-        nmsed_boxlist = box_list_ops.pad_or_clip_box_list(nmsed_boxlist, max_total_size)
-        num_detections = num_valid_nms_boxes
-        nmsed_boxes = nmsed_boxlist.get()
-        nmsed_scores = nmsed_boxlist.get_field(fields.BoxListFields.scores)
-        nmsed_classes = nmsed_boxlist.get_field(fields.BoxListFields.classes)
-        nmsed_masks = nmsed_boxlist.get_field(fields.BoxListFields.masks)
-        nmsed_additional_fields = []
+        nmsed_boxes = nmsed_boxes[:max_total_size]
+        nmsed_scores = nmsed_scores[:max_total_size]
+        nmsed_classes = nmsed_classes[:max_total_size]
+        num_detections = nmsed_boxes.shape[0]
 
-        for key in sorted(per_image_additional_fields.keys()):
-            nmsed_additional_fields.append(nmsed_boxlist.get_field(key).numpy())
-
-        return (
-            [
-                nmsed_boxes.numpy(),
-                nmsed_scores.numpy(),
-                nmsed_classes.numpy(),
-                nmsed_masks.numpy(),
-            ]
-            + nmsed_additional_fields
-            + [num_detections]
-        )
+        return [
+            nmsed_boxes,
+            nmsed_scores,
+            nmsed_classes,
+        ] + [num_detections]
 
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/post_processing.py#L1200-L1215
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/post_processing.py#L422-L651
     def _multiclass_non_max_suppression(
-        boxes: np.array,
-        scores: np.array,
+        boxes: np.ndarray,
+        scores: np.ndarray,
         score_thresh: float,
         iou_thresh: float,
         max_size_per_class: int,
         max_total_size: int = 0,
         clip_window: Optional[np.array] = None,
         change_coordinate_frame: bool = False,
-        masks: Optional[np.array] = None,
         pad_to_max_output_size: bool = False,
-        additional_fields: Optional[Dict[str, np.array]] = None,
         soft_nms_sigma: float = 0.0,
-    ) -> Tuple[box_list.BoxList, int]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 
-        num_scores = scores.shape[0]
         num_classes = scores.shape[1]
 
-        selected_boxes_list = []
+        nms_result = defaultdict(list)
         num_valid_nms_boxes_cumulative = np.array(0, dtype=np.int64)
         per_class_boxes_list = np.moveaxis(boxes, 0, 1)
-        per_class_masks_list = np.moveaxis(masks, 0, 1)
+        per_class_scores_list = np.moveaxis(scores, 0, 1)
 
         boxes_ids = (
             range(num_classes) if len(per_class_boxes_list) > 1 else [0] * num_classes
         )
         for class_idx, boxes_idx in zip(range(num_classes), boxes_ids):
             per_class_boxes = per_class_boxes_list[boxes_idx]
-            boxlist_and_class_scores = box_list.BoxList(
-                tf.convert_to_tensor(per_class_boxes)
-            )
-            class_scores = np.reshape(
-                # TODO: find numpy func corresponding to tf.slice
-                tf.slice(scores, [0, class_idx], np.stack([num_scores, 1])),
-                [-1],
-            )
-
-            boxlist_and_class_scores.add_field(
-                fields.BoxListFields.scores, class_scores
-            )
-            per_class_masks = per_class_masks_list[boxes_idx]
-            boxlist_and_class_scores.add_field(
-                fields.BoxListFields.masks, per_class_masks
-            )
-
-            for key, tensor in additional_fields.items():
-                boxlist_and_class_scores.add_field(key, tensor)
-
-            nms_result = None
-            selected_scores = None
-
-            max_selection_size = np.minimum(
-                max_size_per_class, boxlist_and_class_scores.num_boxes()
-            )
+            per_class_scores = per_class_scores_list[class_idx]
+            max_selection_size = min(max_size_per_class, per_class_boxes.shape[0])
             # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/post_processing.py#L583-L589
             # https://github.com/tensorflow/tensorflow/blob/v2.10.1/tensorflow/python/ops/image_ops_impl.py#L3804-L3891](https://github.com/tensorflow/tensorflow/blob/v2.10.1/tensorflow/python/ops/image_ops_impl.py#L3804-L3891)
             # https://github.com/tensorflow/tensorflow/blob/c7adce4cb2293b66a96b811a0dcdcfb7e361c23f/tensorflow/core/kernels/image/non_max_suppression_op.cc#L829-L907
@@ -796,124 +660,111 @@ def postprocess(
                 selected_indices,
                 selected_scores,
             ) = tf.image.non_max_suppression_with_scores(
-                boxlist_and_class_scores.get(),
-                boxlist_and_class_scores.get_field(fields.BoxListFields.scores),
+                per_class_boxes,
+                per_class_scores,
                 max_selection_size,
                 iou_threshold=iou_thresh,
                 score_threshold=score_thresh,
                 soft_nms_sigma=soft_nms_sigma,
             )
-            num_valid_nms_boxes = selected_indices.shape[0]
-            selected_indices = np.concatenate(
-                [
-                    selected_indices,
-                    np.zeros(max_selection_size - num_valid_nms_boxes, dtype=np.int32),
-                ],
-                0,
-            )
-            selected_scores = np.concatenate(
-                [
-                    selected_scores,
-                    np.zeros(
-                        max_selection_size - num_valid_nms_boxes, dtype=np.float32
-                    ),
-                ],
-                -1,
-            )
-            nms_result = box_list_ops.gather(
-                boxlist_and_class_scores, tf.convert_to_tensor(selected_indices)
-            )
+            if selected_indices is None:
+                continue
 
-            valid_nms_boxes_indices = np.less(
-                np.arange(max_selection_size), num_valid_nms_boxes
-            )
+            selected_boxes = per_class_boxes[selected_indices]
+            num_valid_nms_boxes_cumulative += selected_indices.shape[0]
+            selected_classes = np.full(selected_scores.shape, class_idx)
 
-            nms_result.add_field(
-                fields.BoxListFields.scores,
-                tf.convert_to_tensor(
-                    np.where(
-                        valid_nms_boxes_indices,
-                        selected_scores,
-                        -1 * np.ones(max_selection_size),
-                    )
-                ),
-            )
-            num_valid_nms_boxes_cumulative += num_valid_nms_boxes
+            nms_result["boxes"].append(selected_boxes)
+            nms_result["scores"].append(selected_scores)
+            nms_result["classes"].append(selected_classes)
 
-            nms_result.add_field(
-                fields.BoxListFields.classes,
-                tf.convert_to_tensor(
-                    (
-                        np.zeros_like(nms_result.get_field(fields.BoxListFields.scores))
-                        + class_idx
-                    )
-                ),
-            )
-            selected_boxes_list.append(nms_result)
+        selected_boxes = np.concatenate(nms_result["boxes"])
+        selected_scores = np.concatenate(nms_result["scores"])
+        selected_classes = np.concatenate(nms_result["classes"])
 
-        selected_boxes = box_list_ops.concatenate(selected_boxes_list)
-        sorted_boxes = box_list_ops.sort_by_field(
-            selected_boxes, fields.BoxListFields.scores
-        )
+        # TODO: check argsort
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/box_list_ops.py#L662-L700
+        sorted_boxes = selected_boxes[np.argsort(selected_scores)]
+        sorted_scores = selected_scores[np.argsort(selected_scores)]
+        sorted_classes = selected_classes[np.argsort(selected_scores)]
 
-        sorted_boxes, num_valid_nms_boxes_cumulative = _clip_window_prune_boxes(
+        sorted_boxes, sorted_scores, sorted_classes = _clip_window_prune_boxes(
             sorted_boxes,
+            sorted_scores,
+            sorted_classes,
             clip_window,
             pad_to_max_output_size,
             change_coordinate_frame,
         )
 
-        max_total_size = np.minimum(max_total_size, sorted_boxes.num_boxes())
-        sorted_boxes = box_list_ops.gather(
-            sorted_boxes, tf.convert_to_tensor(np.arange(max_total_size))
-        )
-        num_valid_nms_boxes_cumulative = np.where(
-            max_total_size > num_valid_nms_boxes_cumulative,
-            num_valid_nms_boxes_cumulative,
-            max_total_size,
-        )
-
-        sorted_boxes = box_list_ops.gather(
-            sorted_boxes,
-            tf.convert_to_tensor(np.arange(num_valid_nms_boxes_cumulative)),
-        )
-        return sorted_boxes, num_valid_nms_boxes_cumulative
+        return sorted_boxes, sorted_scores, sorted_classes
 
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/post_processing.py#L636-L638
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/post_processing.py#L345-L388
     def _clip_window_prune_boxes(
-        sorted_boxes: box_list.BoxList,
-        clip_window: np.array,
+        sorted_boxes: np.ndarray,
+        sorted_scores: np.ndarray,
+        sorted_classes: np.ndarray,
+        clip_window: np.ndarray,
         pad_to_max_output_size: bool,
         change_coordinate_frame: bool,
-    ) -> Tuple[box_list.BoxList, int]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/box_list_ops.py#L133-L171
+        def _clip_to_window(
+            boxes: np.ndarray,
+            scores: np.ndarray,
+            classes: np.ndarray,
+            window: np.ndarray,
+            filter_nonoverlapping: bool = True,
+        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+            y_min, x_min, y_max, x_max = np.split(boxes, 4, axis=1)
+            win_y_min = window[0]
+            win_x_min = window[1]
+            win_y_max = window[2]
+            win_x_max = window[3]
+            y_min_clipped = np.maximum(np.minimum(y_min, win_y_max), win_y_min)
+            y_max_clipped = np.maximum(np.minimum(y_max, win_y_max), win_y_min)
+            x_min_clipped = np.maximum(np.minimum(x_min, win_x_max), win_x_min)
+            x_max_clipped = np.maximum(np.minimum(x_max, win_x_max), win_x_min)
+            clipped = np.concatenate(
+                [y_min_clipped, x_min_clipped, y_max_clipped, x_max_clipped], 1
+            )
+            if filter_nonoverlapping:
+                areas = _area(clipped)
+                nonzero_area_indices = np.reshape(np.where(areas > 0.0), -1)
+                clipped = clipped[nonzero_area_indices]
+                scores = scores[nonzero_area_indices]
+                classes = classes[nonzero_area_indices]
+            return clipped, scores, classes
 
-        sorted_boxes = box_list_ops.clip_to_window(
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/box_list_ops.py#L49-L62
+        def _area(boxlist: List[np.ndarray]) -> np.ndarray:
+            y_min, x_min, y_max, x_max = np.split(boxlist, 4, axis=1)
+            return np.squeeze((y_max - y_min) * (x_max - x_min), 1)
+
+        sorted_boxes, sorted_scores, sorted_classes = _clip_to_window(
             sorted_boxes,
-            tf.convert_to_tensor(clip_window),
+            sorted_scores,
+            sorted_classes,
+            clip_window,
             filter_nonoverlapping=not pad_to_max_output_size,
         )
 
-        sorted_boxes_size = sorted_boxes.get().numpy().shape[0]
-        non_zero_box_area = box_list_ops.area(sorted_boxes).numpy().astype(np.bool)
-        sorted_boxes_scores = np.where(
+        sorted_boxes_size = sorted_boxes.shape[0]
+        non_zero_box_area = _area(sorted_boxes).astype(np.bool)
+        sorted_scores = np.where(
             non_zero_box_area,
-            sorted_boxes.get_field(fields.BoxListFields.scores).numpy(),
+            sorted_scores,
             -1 * np.ones(sorted_boxes_size),
         )
-        sorted_boxes.add_field(
-            fields.BoxListFields.scores, tf.convert_to_tensor(sorted_boxes_scores)
-        )
-        num_valid_nms_boxes_cumulative = np.sum(
-            np.greater_equal(sorted_boxes_scores, 0).astype(np.int32)
-        )
-        sorted_boxes = box_list_ops.sort_by_field(
-            sorted_boxes, fields.BoxListFields.scores
-        )
-        sorted_boxes = box_list_ops.change_coordinate_frame(
-            sorted_boxes, tf.convert_to_tensor(clip_window)
-        )
-        return sorted_boxes, num_valid_nms_boxes_cumulative
+
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/box_list_ops.py#L662-L700
+        sorted_boxes = sorted_boxes[np.argsort(sorted_scores)[::-1]]
+        sorted_classes = sorted_classes[np.argsort(sorted_scores)[::-1]]
+        sorted_scores = sorted_scores[np.argsort(sorted_scores)[::-1]]
+
+        sorted_boxes = _change_coordinate_frame(sorted_boxes, clip_window)
+        return sorted_boxes, sorted_scores, sorted_classes
 
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L764-L770
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L129-L134
@@ -929,49 +780,38 @@ def postprocess(
         soft_nms_sigma=0.0,
         change_coordinate_frame=True,
     )
-
-    (
-        nmsed_boxes,
-        nmsed_scores,
-        nmsed_classes,
-        nmsed_masks,
-        nmsed_additional_fields,
-        num_detections,
-    ) = _non_max_suppression_fn(
+    nmsed_boxes, nmsed_scores, nmsed_classes, num_detections = _non_max_suppression_fn(
         detection_boxes,
         detection_scores,
         clip_window=_compute_clip_window(preprocessed_images, tuple(true_image_shapes)),
-        additional_fields=additional_fields,
-        masks=prediction_dict.get("mask_predictions"),
     )
-
-    nmsed_additional_fields = {k: v for k, v in nmsed_additional_fields.items()}
 
     detection_dict = {
         fields.DetectionResultFields.detection_boxes: nmsed_boxes,
         fields.DetectionResultFields.detection_scores: nmsed_scores,
         fields.DetectionResultFields.detection_classes: nmsed_classes,
         fields.DetectionResultFields.num_detections: num_detections,
-        fields.DetectionResultFields.raw_detection_boxes: np.squeeze(
-            detection_boxes, axis=2
-        ),
-        fields.DetectionResultFields.raw_detection_scores: detection_scores_with_background,
     }
-
     return detection_dict
 
 
+# https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/box_list_ops.py#L878
+# https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/box_list_ops.py#L82-L105
+def _scale(boxes: np.ndarray, y_scale: float, x_scale: float, scope=None) -> np.ndarray:
+    y_min, x_min, y_max, x_max = np.split(boxes, 4, axis=1)
+    y_min = y_scale * y_min
+    y_max = y_scale * y_max
+    x_min = x_scale * x_min
+    x_max = x_scale * x_max
+    return np.concatenate((y_min, x_min, y_max, x_max), axis=1)
+
+
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/eval_util.py#L548-L551
+# https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/box_list_ops.py#L881-L920
 def _scale_box_to_absolute(boxes: np.ndarray, image_shape: List[int]) -> np.ndarray:
-    return (
-        box_list_ops.to_absolute_coordinates(
-            box_list.BoxList(tf.convert_to_tensor(boxes)),
-            image_shape[0],
-            image_shape[1],
-        )
-        .get()
-        .numpy()
-    )
+    height, width = image_shape[0], image_shape[1]
+
+    return _scale(boxes, height, width)
 
 
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/eval_util.py#L767-L1065
@@ -1058,9 +898,6 @@ def concat_replica_results(tensor_dict):
     for key, values in tensor_dict.items():
         new_tensor_dict[key] = np.concatenate(values, axis=0)
     return new_tensor_dict
-
-
-
 
 
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/image_resizer_builder.py#L87
@@ -1179,6 +1016,18 @@ def _resize_images_and_return_shapes(
     return resized_inputs, true_image_shapes
 
 
+# https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/box_list_ops.py#L442-L469
+def _change_coordinate_frame(boxes: np.ndarray, window):
+    win_height = window[2] - window[0]
+    win_width = window[3] - window[1]
+    boxlist_new = _scale(
+        boxes - [window[0], window[1], window[0], window[1]],
+        1.0 / win_height,
+        1.0 / win_width,
+    )
+    return boxlist_new
+
+
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L883
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L151-L395
 def transform_input_data(
@@ -1218,11 +1067,8 @@ def transform_input_data(
     )
 
     bboxes = out_tensor_dict[input_fields.groundtruth_boxes]
-    bboxes = tf.convert_to_tensor(bboxes)
-    boxlist = box_list.BoxList(bboxes)
-    realigned_bboxes = box_list_ops.change_coordinate_frame(boxlist, im_box)
-    realigned_boxes_tensor = realigned_bboxes.get()
-    out_tensor_dict[input_fields.groundtruth_boxes] = realigned_boxes_tensor.numpy()
+    realigned_bboxes = _change_coordinate_frame(bboxes, im_box)
+    out_tensor_dict[input_fields.groundtruth_boxes] = realigned_bboxes
 
     out_tensor_dict[input_fields.image] = np.squeeze(preprocessed_resized_image, axis=0)
     out_tensor_dict[input_fields.true_image_shape] = np.squeeze(
