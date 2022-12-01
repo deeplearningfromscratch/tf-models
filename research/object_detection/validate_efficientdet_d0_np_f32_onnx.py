@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import tensorflow.compat.v1 as tf
 from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
 
 from object_detection import eval_util, inputs_np, model_lib
 from object_detection.builders import image_resizer_builder, model_builder
@@ -118,35 +119,14 @@ def eager_eval_loop(
     # arguments and variables which does not acffect eval mAP might be removed or modified.
 
     del postprocess_on_cpu
-    eval_input_config = configs["eval_input_config"]
-    eval_config = configs["eval_config"]
 
     is_training = False
     detection_model._is_training = is_training  # pylint: disable=protected-access
     tf.keras.backend.set_learning_phase(is_training)
-    evaluator_options = eval_util.evaluator_options_from_eval_config(eval_config)
-
-    class_agnostic_category_index = (
-        label_map_util.create_class_agnostic_category_index()
-    )
-
-    class_agnostic_evaluators = eval_util.get_evaluators(
-        eval_config, list(class_agnostic_category_index.values()), evaluator_options
-    )
-
-    class_aware_evaluators = None
-    if eval_input_config.label_map_path:
-        class_aware_category_index = label_map_util.create_category_index_from_labelmap(
-            eval_input_config.label_map_path
-        )
-        class_aware_evaluators = eval_util.get_evaluators(
-            eval_config, list(class_aware_category_index.values()), evaluator_options
-        )
-
-    evaluators = None
 
     strategy = tf.compat.v2.distribute.get_strategy()
 
+    results = []
     for i, (features, labels) in enumerate(eval_dataset.values()):
 
         prediction_dict, groundtruth_dict, eval_features = compute_eval_dict(
@@ -164,35 +144,53 @@ def eager_eval_loop(
         local_groundtruth_dict = concat_replica_results(local_groundtruth_dict)
         local_eval_features = concat_replica_results(local_eval_features)
 
-        eval_dict, class_agnostic = prepare_eval_dict(
+        eval_dict = prepare_eval_dict(
             local_prediction_dict, local_groundtruth_dict, local_eval_features
         )
 
         if i % 100 == 0:
             print(f"Finished eval step %{i}")
 
-        if evaluators is None:
-            if class_agnostic:
-                evaluators = class_agnostic_evaluators
-            else:
-                evaluators = class_aware_evaluators
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/model_lib_v2.py#L1000
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/metrics/coco_evaluation.py#L356
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/metrics/coco_evaluation.py#L230
+        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/metrics/coco_tools.py#L652-L661
+        for bbox, cls, score in zip(
+            eval_dict["detection_boxes"][0],
+            eval_dict["detection_classes"][0],
+            eval_dict["detection_scores"][0],
+        ):
+            results.append(
+                {
+                    "image_id": int(features["hash"]),
+                    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/metrics/coco_tools.py#L359
+                    # convert a box in [ymin, xmin, ymax, xmax] format to COCO format([xmin, ymin, width, height])
+                    "bbox": [
+                        float(bbox[1]),
+                        float(bbox[0]),
+                        float(bbox[3] - bbox[1]),
+                        float(bbox[2] - bbox[0]),
+                    ],
+                    "category_id": int(cls),
+                    "score": float(score),
+                }
+            )
 
-        for evaluator in evaluators:
-            evaluator.add_eval_dict(eval_dict)
         if i == 100:
             break
 
-    eval_metrics = {}
-
-    for evaluator in evaluators:
-        eval_metrics.update(evaluator.evaluate())
-    eval_metrics = {str(k): v for k, v in eval_metrics.items()}
-    for k in eval_metrics:
-        print(f"\t{k}: {eval_metrics[k]}")
-    eval_result = eval_metrics["DetectionBoxes_Precision/mAP"]
-    assert eval_result == 0.4133381090793865, f"{eval_result}"
+    coco_detections = coco.loadRes(results)
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/metrics/coco_tools.py#L207
+    coco_eval = COCOeval(coco, coco_detections, "bbox")
+    coco_eval.params.imgIds = list(set([elem["image_id"] for elem in results]))
+    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/metrics/coco_tools.py#L285-L287
+    coco_eval.evaluate()
+    coco_eval.accumulate()
+    coco_eval.summarize()
+    eval_result = coco_eval.stats
+    assert eval_result[0] == 0.4133381090793865, f"{eval_result[0]}"
     print("test passed.")
-    return eval_metrics
+    return coco_eval
 
 
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/model_lib_v2.py#L896-L926
@@ -947,22 +945,14 @@ def postprocess(
         masks=prediction_dict.get("mask_predictions"),
     )
 
-    nmsed_boxes = tf.convert_to_tensor(nmsed_boxes)
-    nmsed_scores = tf.convert_to_tensor(nmsed_scores)
-    nmsed_classes = tf.convert_to_tensor(nmsed_classes)
-    nmsed_additional_fields = {
-        k: tf.convert_to_tensor(v) for k, v in nmsed_additional_fields.items()
-    }
-    num_detections = tf.convert_to_tensor(num_detections)
+    nmsed_additional_fields = {k: v for k, v in nmsed_additional_fields.items()}
 
     detection_dict = {
         fields.DetectionResultFields.detection_boxes: nmsed_boxes,
         fields.DetectionResultFields.detection_scores: nmsed_scores,
         fields.DetectionResultFields.detection_classes: nmsed_classes,
-        fields.DetectionResultFields.num_detections: tf.cast(
-            num_detections, dtype=tf.float32
-        ),
-        fields.DetectionResultFields.raw_detection_boxes: tf.squeeze(
+        fields.DetectionResultFields.num_detections: num_detections,
+        fields.DetectionResultFields.raw_detection_boxes: np.squeeze(
             detection_boxes, axis=2
         ),
         fields.DetectionResultFields.raw_detection_scores: detection_scores_with_background,
@@ -971,12 +961,67 @@ def postprocess(
     return detection_dict
 
 
+# https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/eval_util.py#L548-L551
+def _scale_box_to_absolute(boxes: np.ndarray, image_shape: List[int]) -> np.ndarray:
+    return (
+        box_list_ops.to_absolute_coordinates(
+            box_list.BoxList(tf.convert_to_tensor(boxes)),
+            image_shape[0],
+            image_shape[1],
+        )
+        .get()
+        .numpy()
+    )
+
+
+# https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/eval_util.py#L767-L1065
+def result_dict_for_batched_example(
+    images,
+    keys,
+    detections,
+    groundtruth=None,
+    class_agnostic=False,
+    scale_to_absolute=False,
+    original_image_spatial_shapes=None,
+    true_image_shapes=None,
+    max_gt_boxes=None,
+    label_id_offset=1,
+):
+    input_data_fields = fields.InputDataFields
+    output_dict = {
+        input_data_fields.original_image: images,
+        input_data_fields.key: keys,
+        input_data_fields.original_image_spatial_shape: (original_image_spatial_shapes),
+        input_data_fields.true_image_shape: true_image_shapes,
+    }
+
+    detection_fields = fields.DetectionResultFields
+    detection_boxes = detections[detection_fields.detection_boxes]
+    detection_scores = detections[detection_fields.detection_scores]
+    num_detections = detections[detection_fields.num_detections]
+
+    detection_classes = detections[detection_fields.detection_classes] + label_id_offset
+
+    output_dict[detection_fields.detection_boxes] = [
+        _scale_box_to_absolute(boxes, image_shape)
+        for boxes, image_shape in zip(detection_boxes, original_image_spatial_shapes)
+    ]
+
+    output_dict[detection_fields.detection_classes] = detection_classes
+    output_dict[detection_fields.detection_scores] = detection_scores
+    output_dict[detection_fields.num_detections] = num_detections
+
+    return output_dict
+
+
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/model_lib_v2.py#L733-L823
-def prepare_eval_dict(detections, groundtruth, features):
+def prepare_eval_dict(
+    detections: Dict[str, np.ndarray],
+    groundtruth: Dict[str, np.ndarray],
+    features: Dict[str, np.ndarray],
+) -> Dict[str, np.ndarray]:
     # copied from https://github.com/deeplearningfromscratch/tf-models/blob/effdet-d0/research/object_detection/validate_efficientdet_d0_tf.py#L267
     # arguments and variables which does not acffect eval mAP might be removed or modified.
-    class_agnostic = fields.DetectionResultFields.detection_classes not in detections
-
     groundtruth_classes_one_hot = groundtruth[
         fields.InputDataFields.groundtruth_classes
     ]
@@ -992,18 +1037,17 @@ def prepare_eval_dict(detections, groundtruth, features):
         fields.InputDataFields.original_image_spatial_shape
     ]
 
-    eval_dict = eval_util.result_dict_for_batched_example(
+    eval_dict = result_dict_for_batched_example(
         eval_images,
         features[inputs_np.HASH_KEY],
         detections,
         groundtruth,
-        class_agnostic=class_agnostic,
         scale_to_absolute=True,
         original_image_spatial_shapes=original_image_spatial_shapes,
         true_image_shapes=true_image_shapes,
     )
 
-    return eval_dict, class_agnostic
+    return eval_dict
 
 
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/model_lib_v2.py#L826-L830
@@ -1012,13 +1056,11 @@ def concat_replica_results(tensor_dict):
     # arguments and variables which does not acffect eval mAP might be removed or modified.
     new_tensor_dict = {}
     for key, values in tensor_dict.items():
-        new_tensor_dict[key] = tf.concat(values, axis=0)
+        new_tensor_dict[key] = np.concatenate(values, axis=0)
     return new_tensor_dict
 
 
-val_image_dir = Path("dataset/mscoco/val2017")
-val_annotations_file = Path("dataset/mscoco/annotations/instances_val2017.json")
-coco = COCO(val_annotations_file)
+
 
 
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/image_resizer_builder.py#L87
@@ -1321,6 +1363,9 @@ if __name__ == "__main__":
     root_dir = "object_detection/efficientdet_d0_coco17_tpu-32/eval"
     pipeline_config_path = os.path.join(root_dir, "pipeline.config")
     checkpoint_dir = os.path.join(root_dir, "checkpoint")
+    val_image_dir = Path("dataset/mscoco/val2017")
+    val_annotations_file = Path("dataset/mscoco/annotations/instances_val2017.json")
+    coco = COCO(val_annotations_file)
     eval_continuously(
         pipeline_config_path=pipeline_config_path,
         model_dir=None,  # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/model_main_tf2.py#L44-L46
