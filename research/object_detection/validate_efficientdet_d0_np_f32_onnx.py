@@ -321,9 +321,7 @@ def predict(
             # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/anchor_generators/multiscale_grid_anchor_generator.py#L142
             # normalize_coordinates = True
             # check_range = False # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/box_list_ops.py#L845
-            anchor_grid = _to_normalized_coordinates(
-                anchor_grid, im_height, im_width
-            )
+            anchor_grid = _to_normalized_coordinates(anchor_grid, im_height, im_width)
             anchor_grid_list.append(anchor_grid)
         return anchor_grid_list
 
@@ -368,14 +366,13 @@ def predict(
         return xgrid, ygrid
 
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/utils/ops.py#L40-L59
-    def _expanded_shape(orig_shape, start_dim, num_dims):
-        start_dim = np.expand_dims(start_dim, 0)
-        # TODO: numpy impl. of tf.slice?
-        before = tf.slice(orig_shape, [0], start_dim)
-        add_shape = np.ones(np.reshape(num_dims, [1])).astype(np.int32)
-        # TODO: numpy impl. of tf.slice?
-        after = tf.slice(orig_shape, start_dim, [-1])
-        new_shape = np.concatenate([before, add_shape, after], 0)
+    def _expanded_shape(
+        orig_shape: List[int], start_dim: int, num_dims: int
+    ) -> List[int]:
+        before = orig_shape[:start_dim]
+        add_shape = np.ones(np.reshape(num_dims, [1]))
+        after = orig_shape[start_dim:]
+        new_shape = np.concatenate([before, add_shape, after], 0).astype(np.int64)
         return new_shape
 
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/anchor_generators/grid_anchor_generator.py#L124-L130
@@ -446,23 +443,22 @@ def _batch_decode(
     batch_size = combined_shape[0]
     tiled_anchor_boxes = np.tile(np.expand_dims(anchors, 0), [batch_size, 1, 1])
     tiled_anchors_boxlist = np.reshape(tiled_anchor_boxes, [-1, 4])
-    
+
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L15-L22
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L1197-L1231
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/box_coder.py#L80-L92
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/box_coders/faster_rcnn_box_coder.py#L92-L118
-    def _box_decode(
-        rel_codes: np.ndarray, anchors: np.ndarray
-    ) -> np.ndarray:
+    def _box_decode(rel_codes: np.ndarray, anchors: np.ndarray) -> np.ndarray:
         # TODO make anchors np array?
         # https://github.com/tensorflow/models/blob/238922e98dd0e8254b5c0921b241a1f5a151782f/research/object_detection/core/box_list.py#L161-L177
         def _get_center_coordinates_and_sizes(box_corners: np.ndarray) -> np.ndarray:
             ymin, xmin, ymax, xmax = np.moveaxis(np.transpose(box_corners), 0, 0)
             width = xmax - xmin
             height = ymax - ymin
-            ycenter = ymin + height / 2.
-            xcenter = xmin + width / 2.
+            ycenter = ymin + height / 2.0
+            xcenter = xmin + width / 2.0
             return [ycenter, xcenter, height, width]
+
         ycenter_a, xcenter_a, ha, wa = _get_center_coordinates_and_sizes(anchors)
 
         # scale_factors=[1.0, 1.0, 1.0, 1.0]
