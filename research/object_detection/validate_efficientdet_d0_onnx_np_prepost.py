@@ -1,18 +1,14 @@
-import copy
 import functools
-import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import onnxruntime as ort
 import tensorflow.compat.v1 as tf
+import tqdm
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
-
-from object_detection.builders import  model_builder
-from object_detection.core import  model
-from object_detection.utils import config_util
 
 # https://stackoverflow.com/questions/35911252/disable-tensorflow-debugging-information
 tf.get_logger().setLevel("ERROR")
@@ -33,92 +29,42 @@ tf.get_logger().setLevel("ERROR")
 
 
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/model_lib_v2.py#L1022-L1169
-def eval_continuously(
-    pipeline_config_path,
-    config_override=None,
-    sample_1_of_n_eval_examples=1,
-    sample_1_of_n_eval_on_train_examples=1,
-    override_eval_num_epochs=True,
-    postprocess_on_cpu=False,
-    checkpoint_dir=None,
-    wait_interval=180,
-    timeout=3600,
-    eval_index=0,
-    **kwargs,
-):
+def eval_continuously():
     # copied from https://github.com/deeplearningfromscratch/tf-models/blob/effdet-d0/research/object_detection/validate_efficientdet_d0_tf.py#L40
     # arguments and variables which does not acffect eval mAP might be removed or modified.
 
-    configs = config_util.get_configs_from_pipeline_file(
-        pipeline_config_path, config_override=config_override
+    eval_input = eval_input_np()
+    session = ort.InferenceSession(ONNX_PATH, providers=["CUDAExecutionProvider"])
+
+    eager_eval_loop(
+        session,
+        eval_input,
     )
 
-    model_config = configs["model"]
-
-    strategy = tf.compat.v2.distribute.get_strategy()
-    with strategy.scope():
-        detection_model = model_builder.build(
-            model_config=model_config, is_training=True
-        )
-
-    eval_input = eval_input_np()
-
-    for latest_checkpoint in tf.train.checkpoints_iterator(
-        checkpoint_dir, timeout=timeout, min_interval_secs=wait_interval
-    ):
-
-        ckpt = tf.compat.v2.train.Checkpoint(model=detection_model)
-
-        ckpt.restore(latest_checkpoint).expect_partial()
-
-        eager_eval_loop(
-            detection_model,
-            eval_input,
-            postprocess_on_cpu=postprocess_on_cpu,
-        )
-
-        return
+    return
 
 
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/model_lib_v2.py#L833-L1019
 def eager_eval_loop(
-    detection_model,
+    session,
     eval_dataset,
-    postprocess_on_cpu=False,
 ):
     # copied from https://github.com/deeplearningfromscratch/tf-models/blob/effdet-d0/research/object_detection/validate_efficientdet_d0_tf.py#L124
     # arguments and variables which does not acffect eval mAP might be removed or modified.
 
-    del postprocess_on_cpu
-
-    is_training = False
-    detection_model._is_training = is_training  # pylint: disable=protected-access
-    tf.keras.backend.set_learning_phase(is_training)
-
-    strategy = tf.compat.v2.distribute.get_strategy()
-
     results = []
-    for i, features in enumerate(eval_dataset.values()):
+    for i, features in tqdm.tqdm(
+        enumerate(eval_dataset.values()),
+        desc="Evaluating",
+        unit="image",
+        mininterval=0.5,
+    ):
+        prediction_dict, eval_features = compute_eval_dict(session, features)
 
-        prediction_dict, eval_features = compute_eval_dict(
-            detection_model, features
-        )
-        (
-            local_prediction_dict,
-            local_eval_features,
-        ) = tf.nest.map_structure(
-            strategy.experimental_local_results,
-            [prediction_dict, eval_features],
-        )
-        local_prediction_dict = concat_replica_results(local_prediction_dict)
-        local_eval_features = concat_replica_results(local_eval_features)
+        local_prediction_dict = concat_replica_results(prediction_dict)
+        local_eval_features = concat_replica_results(eval_features)
 
-        eval_dict = prepare_eval_dict(
-            local_prediction_dict, local_eval_features
-        )
-
-        if i % 100 == 0:
-            print(f"Finished eval step %{i}")
+        eval_dict = prepare_eval_dict(local_prediction_dict, local_eval_features)
 
         # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/model_lib_v2.py#L1000
         # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/metrics/coco_evaluation.py#L356
@@ -145,8 +91,8 @@ def eager_eval_loop(
                 }
             )
 
-        if i == 100:
-            break
+        # if i == 100:
+        #     break
 
     coco_detections = coco.loadRes(results)
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/metrics/coco_tools.py#L207
@@ -157,52 +103,42 @@ def eager_eval_loop(
     coco_eval.accumulate()
     coco_eval.summarize()
     eval_result = coco_eval.stats
-    assert eval_result[0] == 0.4133381090793865, f"{eval_result[0]}"
+    print(f"DetectionBoxes_Precision/mAP {eval_result[0]}")
+    # assert eval_result[0] == 0.4133381090793865, f"{eval_result[0]}"
     print("test passed.")
     return coco_eval
 
 
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/model_lib_v2.py#L896-L926
 def compute_eval_dict(
-    detection_model: model.DetectionModel,
+    session: ort.InferenceSession,
     features: Dict[str, np.ndarray],
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray]]:
     # copied from https://github.com/deeplearningfromscratch/tf-models/blob/effdet-d0/research/object_detection/validate_efficientdet_d0_tf.py#L209
     # arguments and variables which does not acffect eval mAP might be removed or modified.
 
     preprocessed_images = features["image"]
-    prediction_dict = predict(preprocessed_images, detection_model)
+    prediction_dict = predict(preprocessed_images, session)
     prediction_dict = postprocess(
         prediction_dict,
         features["true_image_shape"],
-        detection_model,
     )
     eval_features = {
         "image": features["image"],
-        "original_image": features[
-            "original_image"
-        ],
-        "original_image_spatial_shape": features[
-            "original_image_spatial_shape"
-        ],
-        "true_image_shape": features[
-            "true_image_shape"
-        ],
-        'image_id': features['image_id']
+        "original_image": features["original_image"],
+        "original_image_spatial_shape": features["original_image_spatial_shape"],
+        "true_image_shape": features["true_image_shape"],
+        "image_id": features["image_id"],
     }
     return prediction_dict, eval_features
 
 
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L525
 def predict(
-    preprocessed_inputs: np.ndarray, model: model.DetectionModel
+    preprocessed_inputs: np.ndarray, session: ort.InferenceSession
 ) -> Dict[str, np.ndarray]:
     # copied from https://github.com/deeplearningfromscratch/tf-models/blob/effdet-d0/research/object_detection/meta_architectures/ssd_meta_arch.py#L526
     # arguments and variables which does not acffect eval mAP might be removed or modified.
-    feature_maps = model._feature_extractor(tf.convert_to_tensor(preprocessed_inputs))
-
-    feature_map_spatial_dims = model._get_feature_map_spatial_dims(feature_maps)
-    image_shape = preprocessed_inputs.shape
 
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L585-L588
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L38-L45
@@ -383,25 +319,32 @@ def predict(
     ) -> np.ndarray:
         return _scale(bbox, 1 / height, 1 / width)
 
+    feature_map_spatial_dims = [(64, 64), (32, 32), (16, 16), (8, 8), (4, 4)]
+    image_shape = preprocessed_inputs.shape
+
     boxlist_list = _anchor_generate(
         feature_map_spatial_dims, im_height=image_shape[1], im_width=image_shape[2]
     )
     _anchors = np.concatenate(boxlist_list, 0)
-    predictor_results_dict = model._box_predictor(feature_maps)
+
+    input_name = session.get_inputs()[0].name
+    raw_bboxes, sigmoided_scores = session.run(
+        [], input_feed={input_name: preprocessed_inputs.transpose(0, 3, 1, 2)}
+    )
     predictions_dict = {
+        "box_encodings": raw_bboxes,
+        "detection_scores_with_background": sigmoided_scores,
         "preprocessed_inputs": preprocessed_inputs,
-        "feature_maps": [fm.numpy() for fm in feature_maps],
         "anchors": _anchors,
     }
-    for prediction_key, prediction_list in iter(predictor_results_dict.items()):
-        prediction = np.concatenate(prediction_list, axis=1)
-        predictions_dict[prediction_key] = prediction
     return predictions_dict
 
 
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L1197
 def _batch_decode(
-    box_encodings: np.ndarray, anchors: np.ndarray, model: model.DetectionModel
+    box_encodings: np.ndarray,
+    anchors: np.ndarray,
+    code_size: int,
 ) -> np.ndarray:
     # copied from https://github.com/deeplearningfromscratch/tf-models/blob/effdet-d0/research/object_detection/meta_architectures/ssd_meta_arch.py#L1673
     # arguments and variables which does not acffect eval mAP might be removed or modified.
@@ -442,7 +385,7 @@ def _batch_decode(
         return np.transpose(np.stack([ymin, xmin, ymax, xmax]))
 
     decoded_boxes = _box_decode(
-        np.reshape(box_encodings, [-1, model._box_coder.code_size]),
+        np.reshape(box_encodings, [-1, code_size]),
         tiled_anchors_boxlist,
     )
 
@@ -456,32 +399,20 @@ def _batch_decode(
 def postprocess(
     prediction_dict: Dict[str, np.ndarray],
     true_image_shapes: np.ndarray,
-    model: model.DetectionModel,
 ) -> Dict[str, np.ndarray]:
     # copied from https://github.com/deeplearningfromscratch/tf-models/blob/effdet-d0/research/object_detection/meta_architectures/ssd_meta_arch.py#L802
     # arguments and variables which does not acffect eval mAP might be removed or modified.
 
     preprocessed_images = prediction_dict["preprocessed_inputs"]
     box_encodings = prediction_dict["box_encodings"]
-    class_predictions_with_background = prediction_dict[
-        "class_predictions_with_background"
-    ]
+    detection_scores = prediction_dict["detection_scores_with_background"]
 
-    detection_boxes = _batch_decode(box_encodings, prediction_dict["anchors"], model)
+    # TODO: check reference
+    code_size = 4
+    detection_boxes = _batch_decode(
+        box_encodings, prediction_dict["anchors"], code_size
+    )
     detection_boxes = np.expand_dims(detection_boxes, axis=2)
-
-    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L727-L728](https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L727-L728)
-    # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L135](https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/configs/tf2/ssd_efficientdet_d0_512x512_coco17_tpu-8.config#L135)
-    # https://github.com/tensorflow/models/blob/238922e98dd0e8254b5c0921b241a1f5a151782f/research/object_detection/builders/post_processing_builder.py#L60-L62](https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/post_processing_builder.py#L60-L62)
-    # https://github.com/tensorflow/models/blob/238922e98dd0e8254b5c0921b241a1f5a151782f/research/object_detection/builders/post_processing_builder.py#L140-L141](https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/post_processing_builder.py#L140-L141)
-    # https://github.com/tensorflow/models/blob/238922e98dd0e8254b5c0921b241a1f5a151782f/research/object_detection/builders/post_processing_builder.py#L112-L119](https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/builders/post_processing_builder.py#L112-L119)
-    def _sigmoid(x: np.ndarray) -> np.ndarray:
-        # pylint: disable=invalid-name
-        return 1 / (1 + np.exp(-x))
-
-    detection_scores_with_background = _sigmoid(class_predictions_with_background)
-
-    detection_scores = detection_scores_with_background
 
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L767-L768
     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L486-L523
@@ -812,13 +743,11 @@ def prepare_eval_dict(
 
     eval_images = features["original_image"]
     true_image_shapes = features["true_image_shape"][:, :3]
-    original_image_spatial_shapes = features[
-        "original_image_spatial_shape"
-    ]
+    original_image_spatial_shapes = features["original_image_spatial_shape"]
 
     eval_dict = result_dict_for_batched_example(
         eval_images,
-        features['image_id'],
+        features["image_id"],
         detections,
         original_image_spatial_shapes=original_image_spatial_shapes,
         true_image_shapes=true_image_shapes,
@@ -833,7 +762,7 @@ def concat_replica_results(tensor_dict):
     # arguments and variables which does not acffect eval mAP might be removed or modified.
     new_tensor_dict = {}
     for key, values in tensor_dict.items():
-        new_tensor_dict[key] = np.concatenate(values, axis=0)
+        new_tensor_dict[key] = np.concatenate((values,), axis=0)
     return new_tensor_dict
 
 
@@ -979,9 +908,9 @@ def transform_input_data(
     out_tensor_dict = tensor_dict.copy()
 
     if retain_original_image:
-        out_tensor_dict["original_image"] = image_resizer_fn(
-            out_tensor_dict["image"]
-        )[0].astype(np.uint8)
+        out_tensor_dict["original_image"] = image_resizer_fn(out_tensor_dict["image"])[
+            0
+        ].astype(np.uint8)
 
     # Apply model preprocessing ops and resize instance masks.
     image = out_tensor_dict["image"]
@@ -990,9 +919,7 @@ def transform_input_data(
     )
 
     out_tensor_dict["image"] = np.squeeze(preprocessed_resized_image, axis=0)
-    out_tensor_dict["true_image_shape"] = np.squeeze(
-        true_image_shape, axis=0
-    )
+    out_tensor_dict["true_image_shape"] = np.squeeze(true_image_shape, axis=0)
 
     return out_tensor_dict
 
@@ -1017,23 +944,23 @@ def eval_input_np():
     )
     eval_dataset = dict()
     # fmt: off
-    test_image_id_list = [
-        397133, 475779, 551215, 48153, 21503, 356347, 83113, 312237, 176606, 518770,
-        488270, 11760, 404923, 101420, 45550, 10977, 253386, 76731, 417779, 414034,
-        10363, 11122, 424521, 283785, 279927, 104666, 310622, 449661, 206487, 48555,
-        325527, 46804, 331352, 562121, 434230, 450758, 339442, 442480, 509131, 520264,
-        375278, 50326, 354829, 114871, 340697, 183716, 143572, 17436, 20059, 349837,
-        578093, 351823, 449996, 187236, 27696, 213816, 382111, 159112, 469067, 91500,
-        360325, 329827, 294163, 50165, 226111, 109798, 550426, 8021, 100582, 130599,
-        475064, 221708, 110211, 120420, 123131, 295316, 103585, 509735, 205105, 42070,
-        533206, 493286, 130699, 255483, 315450, 217948, 32038, 369675, 567825, 152771,
-        229601, 418961, 78565, 187990, 78823, 289229, 443303, 474028, 263796, 375015,
-        284282,
-    ]
+    # test_image_id_list = [
+    #     397133, 475779, 551215, 48153, 21503, 356347, 83113, 312237, 176606, 518770,
+    #     488270, 11760, 404923, 101420, 45550, 10977, 253386, 76731, 417779, 414034,
+    #     10363, 11122, 424521, 283785, 279927, 104666, 310622, 449661, 206487, 48555,
+    #     325527, 46804, 331352, 562121, 434230, 450758, 339442, 442480, 509131, 520264,
+    #     375278, 50326, 354829, 114871, 340697, 183716, 143572, 17436, 20059, 349837,
+    #     578093, 351823, 449996, 187236, 27696, 213816, 382111, 159112, 469067, 91500,
+    #     360325, 329827, 294163, 50165, 226111, 109798, 550426, 8021, 100582, 130599,
+    #     475064, 221708, 110211, 120420, 123131, 295316, 103585, 509735, 205105, 42070,
+    #     533206, 493286, 130699, 255483, 315450, 217948, 32038, 369675, 567825, 152771,
+    #     229601, 418961, 78565, 187990, 78823, 289229, 443303, 474028, 263796, 375015,
+    #     284282,
+    # ]
     # fmt: on
     for image_id in coco.getImgIds():
-        if image_id not in test_image_id_list:
-            continue
+        # if image_id not in test_image_id_list:
+        #     continue
         image = coco.loadImgs(ids=[image_id])[0]
         tensor_dict = dict()
         features = dict()
@@ -1046,7 +973,7 @@ def eval_input_np():
         tensor_dict["image"] = img
         h, w = image["height"], image["width"]
         tensor_dict["true_image_shape"] = [h, w, 3]
-        tensor_dict["original_image_spatial_shape"] = [h, w]        
+        tensor_dict["original_image_spatial_shape"] = [h, w]
         tensor_dict = transform_data_fn(tensor_dict)
 
         features["image"] = np.expand_dims(tensor_dict["image"], 0)
@@ -1065,19 +992,8 @@ def eval_input_np():
 
 
 if __name__ == "__main__":
-    root_dir = "object_detection/efficientdet_d0_coco17_tpu-32/eval"
-    pipeline_config_path = os.path.join(root_dir, "pipeline.config")
-    checkpoint_dir = os.path.join(root_dir, "checkpoint")
     val_image_dir = Path("dataset/mscoco/val2017")
     val_annotations_file = Path("dataset/mscoco/annotations/instances_val2017.json")
     coco = COCO(val_annotations_file)
-    eval_continuously(
-        pipeline_config_path=pipeline_config_path,
-        model_dir=None,  # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/model_main_tf2.py#L44-L46
-        trans_steps=None,  # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/model_main_tf2.py#L35
-        sample_1_of_n_eval_examples=None,  # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/model_main_tf2.py#L38-L39
-        sample_1_of_n_eval_on_train_examples=5,  # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/model_main_tf2.py#L40-L43
-        checkpoint_dir=checkpoint_dir,  # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/model_main_tf2.py#L47-L50
-        wait_interval=300,  # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/model_main_tf2.py#L89
-        timeout=3600,  # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/model_main_tf2.py#L52-L53
-    )
+    ONNX_PATH = "object_detection/efficientdet_d0.onnx"
+    eval_continuously()
