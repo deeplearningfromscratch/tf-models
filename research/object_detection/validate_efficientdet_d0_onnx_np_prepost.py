@@ -1,4 +1,3 @@
-import collections
 import copy
 import functools
 import os
@@ -11,17 +10,9 @@ import tensorflow.compat.v1 as tf
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
-from object_detection import eval_util, inputs_np, model_lib
-from object_detection.builders import image_resizer_builder, model_builder
-from object_detection.core import box_list, box_list_ops, model
-from object_detection.core import standard_fields as fields
-from object_detection.utils import config_util, label_map_util
-from object_detection.utils import ops
-from object_detection.utils import ops as util_ops
-from object_detection.utils import shape_utils
-
-# https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/inputs.py#L48
-_LABEL_OFFSET = 1
+from object_detection.builders import  model_builder
+from object_detection.core import  model
+from object_detection.utils import config_util
 
 # https://stackoverflow.com/questions/35911252/disable-tensorflow-debugging-information
 tf.get_logger().setLevel("ERROR")
@@ -61,27 +52,8 @@ def eval_continuously(
     configs = config_util.get_configs_from_pipeline_file(
         pipeline_config_path, config_override=config_override
     )
-    kwargs.update({"sample_1_of_n_eval_examples": sample_1_of_n_eval_examples})
-    configs = config_util.merge_external_params_with_configs(
-        configs, None, kwargs_dict=kwargs
-    )
 
     model_config = configs["model"]
-    train_input_config = configs["train_input_config"]
-    eval_on_train_input_config = copy.deepcopy(train_input_config)
-    eval_on_train_input_config.sample_1_of_n_examples = (
-        sample_1_of_n_eval_on_train_examples
-    )
-    if override_eval_num_epochs and eval_on_train_input_config.num_epochs != 1:
-        tf.logging.warning(
-            (
-                "Expected number of evaluation epochs is 1, but "
-                "instead encountered `eval_on_train_input_config"
-                ".num_epochs` = %d. Overwriting `num_epochs` to 1."
-            ),
-            eval_on_train_input_config.num_epochs,
-        )
-        eval_on_train_input_config.num_epochs = 1
 
     strategy = tf.compat.v2.distribute.get_strategy()
     with strategy.scope():
@@ -89,7 +61,7 @@ def eval_continuously(
             model_config=model_config, is_training=True
         )
 
-    eval_input = eval_input_np(model_config)
+    eval_input = eval_input_np()
 
     for latest_checkpoint in tf.train.checkpoints_iterator(
         checkpoint_dir, timeout=timeout, min_interval_secs=wait_interval
@@ -101,7 +73,6 @@ def eval_continuously(
 
         eager_eval_loop(
             detection_model,
-            configs,
             eval_input,
             postprocess_on_cpu=postprocess_on_cpu,
         )
@@ -112,7 +83,6 @@ def eval_continuously(
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/model_lib_v2.py#L833-L1019
 def eager_eval_loop(
     detection_model,
-    configs,
     eval_dataset,
     postprocess_on_cpu=False,
 ):
@@ -128,25 +98,23 @@ def eager_eval_loop(
     strategy = tf.compat.v2.distribute.get_strategy()
 
     results = []
-    for i, (features, labels) in enumerate(eval_dataset.values()):
+    for i, features in enumerate(eval_dataset.values()):
 
-        prediction_dict, groundtruth_dict, eval_features = compute_eval_dict(
-            detection_model, features, labels
+        prediction_dict, eval_features = compute_eval_dict(
+            detection_model, features
         )
         (
             local_prediction_dict,
-            local_groundtruth_dict,
             local_eval_features,
         ) = tf.nest.map_structure(
             strategy.experimental_local_results,
-            [prediction_dict, groundtruth_dict, eval_features],
+            [prediction_dict, eval_features],
         )
         local_prediction_dict = concat_replica_results(local_prediction_dict)
-        local_groundtruth_dict = concat_replica_results(local_groundtruth_dict)
         local_eval_features = concat_replica_results(local_eval_features)
 
         eval_dict = prepare_eval_dict(
-            local_prediction_dict, local_groundtruth_dict, local_eval_features
+            local_prediction_dict, local_eval_features
         )
 
         if i % 100 == 0:
@@ -163,7 +131,7 @@ def eager_eval_loop(
         ):
             results.append(
                 {
-                    "image_id": int(features["hash"]),
+                    "image_id": int(features["image_id"]),
                     # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/metrics/coco_tools.py#L359
                     # convert a box in [ymin, xmin, ymax, xmax] format to COCO format([xmin, ymin, width, height])
                     "bbox": [
@@ -198,33 +166,31 @@ def eager_eval_loop(
 def compute_eval_dict(
     detection_model: model.DetectionModel,
     features: Dict[str, np.ndarray],
-    labels: Dict[str, np.ndarray],
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray]]:
     # copied from https://github.com/deeplearningfromscratch/tf-models/blob/effdet-d0/research/object_detection/validate_efficientdet_d0_tf.py#L209
     # arguments and variables which does not acffect eval mAP might be removed or modified.
 
-    groundtruth_dict = labels
-    preprocessed_images = features[fields.InputDataFields.image]
+    preprocessed_images = features["image"]
     prediction_dict = predict(preprocessed_images, detection_model)
     prediction_dict = postprocess(
         prediction_dict,
-        features[fields.InputDataFields.true_image_shape],
+        features["true_image_shape"],
         detection_model,
     )
     eval_features = {
-        fields.InputDataFields.image: features[fields.InputDataFields.image],
-        fields.InputDataFields.original_image: features[
-            fields.InputDataFields.original_image
+        "image": features["image"],
+        "original_image": features[
+            "original_image"
         ],
-        fields.InputDataFields.original_image_spatial_shape: features[
-            fields.InputDataFields.original_image_spatial_shape
+        "original_image_spatial_shape": features[
+            "original_image_spatial_shape"
         ],
-        fields.InputDataFields.true_image_shape: features[
-            fields.InputDataFields.true_image_shape
+        "true_image_shape": features[
+            "true_image_shape"
         ],
-        inputs_np.HASH_KEY: features[inputs_np.HASH_KEY],
+        'image_id': features['image_id']
     }
-    return prediction_dict, groundtruth_dict, eval_features
+    return prediction_dict, eval_features
 
 
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/meta_architectures/ssd_meta_arch.py#L525
@@ -549,10 +515,8 @@ def postprocess(
         score_thresh: float,
         iou_thresh: float,
         max_size_per_class: int,
-        max_total_size: int = 0,
+        max_total_size: int,
         clip_window: Optional[np.array] = None,
-        change_coordinate_frame: bool = False,
-        num_valid_boxes: Optional[int] = None,
         soft_nms_sigma: float = 0.0,
     ) -> Tuple[np.array, np.array, np.array, np.array, Dict[str, np.array], np.array]:
         boxes_shape = boxes.shape
@@ -563,7 +527,6 @@ def postprocess(
             "iou_thresh": iou_thresh,
             "max_size_per_class": max_size_per_class,
             "max_total_size": max_total_size,
-            "change_coordinate_frame": change_coordinate_frame,
             "soft_nms_sigma": soft_nms_sigma,
         }
         # for loop impl. of tf.map_fn
@@ -626,9 +589,8 @@ def postprocess(
         score_thresh: float,
         iou_thresh: float,
         max_size_per_class: int,
-        max_total_size: int = 0,
+        max_total_size: int,
         clip_window: Optional[np.array] = None,
-        change_coordinate_frame: bool = False,
         pad_to_max_output_size: bool = False,
         soft_nms_sigma: float = 0.0,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -690,7 +652,6 @@ def postprocess(
             sorted_classes,
             clip_window,
             pad_to_max_output_size,
-            change_coordinate_frame,
         )
 
         return sorted_boxes, sorted_scores, sorted_classes
@@ -703,7 +664,6 @@ def postprocess(
         sorted_classes: np.ndarray,
         clip_window: np.ndarray,
         pad_to_max_output_size: bool,
-        change_coordinate_frame: bool,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/core/box_list_ops.py#L133-L171
         def _clip_to_window(
@@ -774,7 +734,6 @@ def postprocess(
         max_size_per_class=100,
         max_total_size=100,
         soft_nms_sigma=0.0,
-        change_coordinate_frame=True,
     )
     nmsed_boxes, nmsed_scores, nmsed_classes, num_detections = _non_max_suppression_fn(
         detection_boxes,
@@ -783,10 +742,10 @@ def postprocess(
     )
 
     detection_dict = {
-        fields.DetectionResultFields.detection_boxes: nmsed_boxes,
-        fields.DetectionResultFields.detection_scores: nmsed_scores,
-        fields.DetectionResultFields.detection_classes: nmsed_classes,
-        fields.DetectionResultFields.num_detections: num_detections,
+        "detection_boxes": nmsed_boxes,
+        "detection_scores": nmsed_scores,
+        "detection_classes": nmsed_classes,
+        "num_detections": num_detections,
     }
     return detection_dict
 
@@ -815,37 +774,31 @@ def result_dict_for_batched_example(
     images,
     keys,
     detections,
-    groundtruth=None,
-    class_agnostic=False,
-    scale_to_absolute=False,
     original_image_spatial_shapes=None,
     true_image_shapes=None,
-    max_gt_boxes=None,
     label_id_offset=1,
 ):
-    input_data_fields = fields.InputDataFields
     output_dict = {
-        input_data_fields.original_image: images,
-        input_data_fields.key: keys,
-        input_data_fields.original_image_spatial_shape: (original_image_spatial_shapes),
-        input_data_fields.true_image_shape: true_image_shapes,
+        "original_image": images,
+        "key": keys,
+        "original_image_spatial_shape": (original_image_spatial_shapes),
+        "true_image_shape": true_image_shapes,
     }
 
-    detection_fields = fields.DetectionResultFields
-    detection_boxes = detections[detection_fields.detection_boxes]
-    detection_scores = detections[detection_fields.detection_scores]
-    num_detections = detections[detection_fields.num_detections]
+    detection_boxes = detections["detection_boxes"]
+    detection_scores = detections["detection_scores"]
+    num_detections = detections["num_detections"]
 
-    detection_classes = detections[detection_fields.detection_classes] + label_id_offset
+    detection_classes = detections["detection_classes"] + label_id_offset
 
-    output_dict[detection_fields.detection_boxes] = [
+    output_dict["detection_boxes"] = [
         _scale_box_to_absolute(boxes, image_shape)
         for boxes, image_shape in zip(detection_boxes, original_image_spatial_shapes)
     ]
 
-    output_dict[detection_fields.detection_classes] = detection_classes
-    output_dict[detection_fields.detection_scores] = detection_scores
-    output_dict[detection_fields.num_detections] = num_detections
+    output_dict["detection_classes"] = detection_classes
+    output_dict["detection_scores"] = detection_scores
+    output_dict["num_detections"] = num_detections
 
     return output_dict
 
@@ -853,32 +806,20 @@ def result_dict_for_batched_example(
 # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/model_lib_v2.py#L733-L823
 def prepare_eval_dict(
     detections: Dict[str, np.ndarray],
-    groundtruth: Dict[str, np.ndarray],
     features: Dict[str, np.ndarray],
 ) -> Dict[str, np.ndarray]:
     # copied from https://github.com/deeplearningfromscratch/tf-models/blob/effdet-d0/research/object_detection/validate_efficientdet_d0_tf.py#L267
-    # arguments and variables which does not acffect eval mAP might be removed or modified.
-    groundtruth_classes_one_hot = groundtruth[
-        fields.InputDataFields.groundtruth_classes
-    ]
-    label_id_offset = 1
-    groundtruth_classes = (
-        tf.argmax(groundtruth_classes_one_hot, axis=2) + label_id_offset
-    )
-    groundtruth[fields.InputDataFields.groundtruth_classes] = groundtruth_classes
 
-    eval_images = features[fields.InputDataFields.original_image]
-    true_image_shapes = features[fields.InputDataFields.true_image_shape][:, :3]
+    eval_images = features["original_image"]
+    true_image_shapes = features["true_image_shape"][:, :3]
     original_image_spatial_shapes = features[
-        fields.InputDataFields.original_image_spatial_shape
+        "original_image_spatial_shape"
     ]
 
     eval_dict = result_dict_for_batched_example(
         eval_images,
-        features[inputs_np.HASH_KEY],
+        features['image_id'],
         detections,
-        groundtruth,
-        scale_to_absolute=True,
         original_image_spatial_shapes=original_image_spatial_shapes,
         true_image_shapes=true_image_shapes,
     )
@@ -1030,56 +971,29 @@ def transform_input_data(
     tensor_dict: Dict[str, np.ndarray],
     model_preprocess_fn,
     image_resizer_fn: functools.partial,
-    num_classes: int,
     retain_original_image: bool = True,
 ) -> Dict[str, Union[np.ndarray, List]]:
     # copied from https://github.com/deeplearningfromscratch/tf-models/blob/effdet-d0/research/object_detection/inputs_np.py#L65
     # arguments and variables which does not acffect eval mAP might be removed or modified.
 
     out_tensor_dict = tensor_dict.copy()
-    input_fields = fields.InputDataFields
 
     if retain_original_image:
-        out_tensor_dict[input_fields.original_image] = image_resizer_fn(
-            out_tensor_dict[input_fields.image]
+        out_tensor_dict["original_image"] = image_resizer_fn(
+            out_tensor_dict["image"]
         )[0].astype(np.uint8)
 
     # Apply model preprocessing ops and resize instance masks.
-    image = out_tensor_dict[input_fields.image]
+    image = out_tensor_dict["image"]
     preprocessed_resized_image, true_image_shape = model_preprocess_fn(
         np.expand_dims(image.astype(np.float32), axis=0)
     )
 
-    preprocessed_shape = preprocessed_resized_image.shape
-    new_height, new_width = preprocessed_shape[1], preprocessed_shape[2]
-
-    im_box = np.stack(
-        [
-            0.0,
-            0.0,
-            float(new_height) / float(true_image_shape[0, 0]),
-            float(new_width) / float(true_image_shape[0, 1]),
-        ]
-    )
-
-    bboxes = out_tensor_dict[input_fields.groundtruth_boxes]
-    realigned_bboxes = _change_coordinate_frame(bboxes, im_box)
-    out_tensor_dict[input_fields.groundtruth_boxes] = realigned_bboxes
-
-    out_tensor_dict[input_fields.image] = np.squeeze(preprocessed_resized_image, axis=0)
-    out_tensor_dict[input_fields.true_image_shape] = np.squeeze(
+    out_tensor_dict["image"] = np.squeeze(preprocessed_resized_image, axis=0)
+    out_tensor_dict["true_image_shape"] = np.squeeze(
         true_image_shape, axis=0
     )
 
-    zero_indexed_groundtruth_classes = (
-        out_tensor_dict[input_fields.groundtruth_classes] - _LABEL_OFFSET
-    )
-    out_tensor_dict[input_fields.groundtruth_classes] = np.eye(num_classes)[
-        zero_indexed_groundtruth_classes.reshape(-1)
-    ]
-    out_tensor_dict[input_fields.num_groundtruth_boxes] = np.array(
-        out_tensor_dict[input_fields.groundtruth_boxes].shape[0], dtype=np.int32
-    )
     return out_tensor_dict
 
 
@@ -1095,14 +1009,11 @@ def _feature_extractor_preprocess(inputs: np.ndarray) -> np.ndarray:
     return ((inputs / 255.0) - [[channel_offset]]) / [[channel_scale]]
 
 
-def eval_input_np(model_config):
-    num_classes = config_util.get_number_of_classes(model_config)
-
+def eval_input_np():
     transform_data_fn = functools.partial(
         transform_input_data,
         model_preprocess_fn=_preprocess,
         image_resizer_fn=_image_resizer_fn,
-        num_classes=num_classes,
     )
     eval_dataset = dict()
     # fmt: off
@@ -1126,7 +1037,6 @@ def eval_input_np(model_config):
         image = coco.loadImgs(ids=[image_id])[0]
         tensor_dict = dict()
         features = dict()
-        labels = dict()
         # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/dataset_tools/create_coco_tf_record.py#L171-L173
         with tf.gfile.GFile(val_image_dir / image["file_name"], "rb") as fid:
             encoded_jpg = fid.read()
@@ -1136,45 +1046,11 @@ def eval_input_np(model_config):
         tensor_dict["image"] = img
         h, w = image["height"], image["width"]
         tensor_dict["true_image_shape"] = [h, w, 3]
-        tensor_dict["original_image_spatial_shape"] = [h, w]
-
-        anns = coco.imgToAnns[image_id]
-        tensor_dict["num_groundtruth_boxes"] = len(anns)
-        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/dataset_tools/create_coco_tf_record.py#L128-L134
-        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/dataset_tools/create_coco_tf_record.py#L207-L222
-        # https://github.com/tensorflow/models/blob/3afd339ff97e0c2576300b245f69243fc88e066f/research/object_detection/data_decoders/tf_example_decoder.py#L293-L295
-        xmin = []
-        xmax = []
-        ymin = []
-        ymax = []
-        bboxes = []
-        for subdict in anns:
-            (x, y, width, height) = tuple(subdict["bbox"])
-            xmin = float(x) / w
-            xmax = float(x + width) / w
-            ymin = float(y) / h
-            ymax = float(y + height) / h
-            bboxes.append([ymin, xmin, ymax, xmax])
-        tensor_dict["groundtruth_boxes"] = np.asarray(bboxes, dtype=np.float32)
-        tensor_dict["groundtruth_classes"] = np.asarray(
-            [subdict["category_id"] for subdict in anns], dtype=np.int64
-        )
-        tensor_dict["groundtruth_area"] = np.asarray(
-            [subdict["area"] for subdict in anns], dtype=np.float32
-        )
-        tensor_dict["groundtruth_is_crowd"] = np.asarray(
-            [bool(subdict["iscrowd"]) for subdict in anns], dtype=bool
-        )
-        if len(anns) == 0:
-            tensor_dict["groundtruth_boxes"] = np.empty((0, 4), dtype=np.float32)
-            tensor_dict["groundtruth_classes"] = np.empty(0, dtype=np.int64)
-            tensor_dict["groundtruth_area"] = np.empty(0, dtype=np.float32)
-            tensor_dict["groundtruth_is_crowd"] = np.empty(0, dtype=bool)
-
+        tensor_dict["original_image_spatial_shape"] = [h, w]        
         tensor_dict = transform_data_fn(tensor_dict)
 
         features["image"] = np.expand_dims(tensor_dict["image"], 0)
-        features["hash"] = np.expand_dims(image_id, 0)
+        features["image_id"] = np.expand_dims(image_id, 0)
         features["true_image_shape"] = np.expand_dims(
             tensor_dict["true_image_shape"], 0
         )
@@ -1182,21 +1058,8 @@ def eval_input_np(model_config):
             tensor_dict["original_image_spatial_shape"], 0
         )
         features["original_image"] = np.expand_dims(tensor_dict["original_image"], 0)
-        labels["num_groundtruth_boxes"] = np.expand_dims(
-            tensor_dict["num_groundtruth_boxes"], 0
-        )
-        labels["groundtruth_boxes"] = np.expand_dims(
-            tensor_dict["groundtruth_boxes"], 0
-        )
-        labels["groundtruth_classes"] = np.expand_dims(
-            tensor_dict["groundtruth_classes"], 0
-        )
-        labels["groundtruth_area"] = np.expand_dims(tensor_dict["groundtruth_area"], 0)
-        labels["groundtruth_is_crowd"] = np.expand_dims(
-            tensor_dict["groundtruth_is_crowd"], 0
-        )
 
-        eval_dataset[image_id] = [features, labels]
+        eval_dataset[image_id] = features
 
     return eval_dataset
 
